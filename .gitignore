@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+
+# 数据文件
+*.gz
+*.jsonl
+
+# 配置文件（如果包含敏感信息）
+# config.py  # 取消注释以忽略配置文件
+
+# 操作系统
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+
+# 测试文件
+.pytest_cache/
+.coverage
+htmlcov/
+
