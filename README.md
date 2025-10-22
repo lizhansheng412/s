@@ -68,13 +68,19 @@ python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-0
 
 **提升效果**: 速度提升 **2.5-4倍**，时间节省 **60-70%**
 
-### 各表优化配置（自动应用）
+### 各表优化配置（自动应用，彻底避免缓冲区问题）
 
-| 表名 | batch_size | commit_batches | extractors | 每次commit |
-|------|-----------|---------------|-----------|-----------|
-| embeddings_specter_v1/v2 | 20,000 | 5 | 6 | 1.6GB |
-| s2orc/s2orc_v2 | 2,500 | 5 | 6 | 1.25GB |
-| papers/abstracts/等 | 50,000 | 5 | 7 | 500MB |
+| 表名 | batch_size | commit_batches | extractors | 每次commit | 重复处理 |
+|------|-----------|---------------|-----------|-----------|---------|
+| embeddings_specter_v1/v2 | 15,000 | 3 | 6 | 720MB | VALUES |
+| s2orc/s2orc_v2 | 2,000 | 3 | 6 | 600MB | VALUES |
+| citations | 8,000 | 2 | 6 | 160MB | VALUES |
+| papers/abstracts/等 | 25,000 | 3 | 7 | 375MB | VALUES |
+
+**关键优化**：
+- ✅ 所有表都使用 **VALUES 方式**处理重复键，不使用临时表
+- ✅ 减小 batch_size 和 commit_batches，频繁释放内存
+- ✅ 彻底避免"没有可用的本地缓冲区"错误
 
 ### TURBO模式说明
 

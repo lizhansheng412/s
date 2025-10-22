@@ -37,27 +37,27 @@ from database.config.db_config_v2 import DB_CONFIG, FIELD_TABLES
 # 根据数据大小动态配置（关键优化！）
 # =============================================================================
 
-# 针对TEXT类型优化配置（平衡：性能 vs 内存安全，单次commit不超过2GB）
+# 针对TEXT类型优化配置（彻底避免缓冲区问题：不使用临时表，使用VALUES）
 TABLE_CONFIGS = {
-    # 超大数据 (60-120KB/条): s2orc系列 - 控制内存使用
-    's2orc': {'batch_size': 2500, 'commit_batches': 5, 'extractors': 6},
-    's2orc_v2': {'batch_size': 2500, 'commit_batches': 5, 'extractors': 6},
-    # 2500条×100KB=250MB/批，5批=1.25GB提交 ✓
+    # 超大数据 (60-120KB/条): s2orc系列 - 控制内存使用，频繁commit
+    's2orc': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 6},
+    's2orc_v2': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 6},
+    # 2000条×100KB=200MB/批，3批=600MB提交（安全+频繁释放）
         
-    # 中等数据 (16KB/条): embeddings系列 - 平衡优化（关键：单次commit ~1.6GB）
-    'embeddings_specter_v1': {'batch_size': 20000, 'commit_batches': 5, 'extractors': 6},
-    'embeddings_specter_v2': {'batch_size': 20000, 'commit_batches': 5, 'extractors': 6},
-    # 20000条×16KB=320MB/批，5批=1.6GB提交（安全范围内的大批次）
+    # 中等数据 (16KB/条): embeddings系列 - 减小批次，频繁commit
+    'embeddings_specter_v1': {'batch_size': 15000, 'commit_batches': 3, 'extractors': 6},
+    'embeddings_specter_v2': {'batch_size': 15000, 'commit_batches': 3, 'extractors': 6},
+    # 15000条×16KB=240MB/批，3批=720MB提交（安全范围）
     
-    # 小数据 (1-3KB/条): 其他表 - 减小batch避免缓冲区耗尽
-    'papers': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    'abstracts': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    'authors': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    'citations': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    'paper_ids': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    'publication_venues': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    'tldrs': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
-    # 50000条×2KB=100MB/批，5批=500MB提交（避免缓冲区耗尽）
+    # 小数据 (1-3KB/条): 其他表 - 小批次+频繁commit
+    'papers': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
+    'abstracts': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
+    'authors': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
+    'citations': {'batch_size': 8000, 'commit_batches': 2, 'extractors': 6},  # citations最容易重复
+    'paper_ids': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
+    'publication_venues': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
+    'tldrs': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
+    # 所有表统一策略：小批次+频繁commit，彻底避免缓冲区问题
 }
 
 DEFAULT_CONFIG = {'batch_size': 100000, 'commit_batches': 5, 'extractors': 6}
@@ -250,8 +250,8 @@ def inserter_worker(
             cursor.execute("SET synchronous_commit = OFF")  # 异步提交（关键优化）
             cursor.execute("SET commit_delay = 100000")  # 延迟提交100ms（PostgreSQL最大值）
             cursor.execute("SET maintenance_work_mem = '4GB'")  # 维护内存（安全值）
-            cursor.execute("SET work_mem = '2GB'")  # 工作内存（安全值）
-            cursor.execute("SET temp_buffers = '4GB'")  # 临时缓冲区（增大，避免耗尽）
+            cursor.execute("SET work_mem = '1GB'")  # 工作内存（减小，避免缓冲区耗尽）
+            cursor.execute("SET temp_buffers = '8GB'")  # 临时缓冲区（翻倍，关键！）
             cursor.execute("SET effective_cache_size = '24GB'")  # 缓存大小（假设系统32GB内存）
             cursor.execute("SET max_parallel_workers_per_gather = 0")  # 关闭并行（批量插入不需要）
         except Exception as e:
@@ -409,16 +409,16 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
     数据以TEXT格式存储（不验证不解析，极速）
     
     注意：
-    - 所有表的主键列名都是corpusid（表结构统一）
-    - primary_key参数仅用于标识，实际SQL都使用corpusid
-    - batch中的key_value是从JSON不同字段提取的（authorid/citedcorpusid/corpusid）
+    - authors表：主键列名是authorid
+    - citations表：主键列名是citedcorpusid
+    - 其他表：主键列名是corpusid
     
     Args:
         cursor: 数据库游标
         table_name: 表名
         batch: 数据批次 [(key_value, json_line), ...] - key_value已从JSON正确字段提取
         use_upsert: 是否使用UPSERT模式
-        primary_key: 标识字段名（仅用于日志，SQL固定用corpusid）
+        primary_key: 主键列名（authorid/citedcorpusid/corpusid）
     """
     if not batch:
         return 0
@@ -434,34 +434,38 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
             for key_value, data in batch:
                 seen[key_value] = data
             
-            # 2. 构建buffer（一次性写入）
-            buffer = StringIO()
-            lines = [f"{key_val}\t{data}\n" for key_val, data in seen.items()]
-            buffer.write(''.join(lines))
-            buffer.seek(0)
+            # 2. 使用VALUES批量UPSERT（避免临时表耗尽缓冲区）
+            # 分小批次插入，每次最多1000条
+            chunk_size = 1000
+            total_processed = 0
             
-            # 3. 使用临时表UPSERT（所有表的主键列都叫corpusid）
-            temp_table = f"temp_{table_name}_{id(buffer)}"
-            cursor.execute(f"CREATE TEMP TABLE {temp_table} (corpusid BIGINT, data JSONB) ON COMMIT DROP")
-            cursor.copy_expert(
-                f"COPY {temp_table} (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
-                buffer
-            )
+            for i in range(0, len(seen), chunk_size):
+                chunk_items = list(seen.items())[i:i + chunk_size]
+                
+                # 构建VALUES子句
+                values_list = []
+                for key_val, data in chunk_items:
+                    # 转义单引号
+                    escaped_data = data.replace("'", "''")
+                    values_list.append(f"({key_val}, '{escaped_data}', NOW(), NOW())")
+                
+                values_clause = ','.join(values_list)
+                
+                # 批量UPSERT
+                cursor.execute(f"""
+                    INSERT INTO {table_name} ({primary_key}, data, insert_time, update_time)
+                    VALUES {values_clause}
+                    ON CONFLICT ({primary_key}) DO UPDATE SET
+                        data = EXCLUDED.data,
+                        update_time = EXCLUDED.update_time
+                """)
+                total_processed += len(chunk_items)
             
-            # 4. 简化的UPSERT（主键列固定是corpusid）
-            cursor.execute(f"""
-                INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
-                SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
-                ON CONFLICT (corpusid) DO UPDATE SET
-                    data = EXCLUDED.data,
-                    update_time = EXCLUDED.update_time
-            """)
-            
-            return len(seen)
+            return total_processed
         else:
             # INSERT模式：极速COPY（TEXT类型，不验证不解析，最快）
             buffer = StringIO()
-            lines = [f"{cid}\t{data}\t\\N\t\\N\n" for cid, data in batch]
+            lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch]
             buffer.write(''.join(lines))
             buffer.seek(0)
             
@@ -475,33 +479,38 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
                 )
                 return len(batch)
             except psycopg2.errors.UniqueViolation:
-                # 有重复key，回滚后用临时表+ON CONFLICT处理
+                # 有重复key，使用VALUES逐条插入（避免临时表耗尽缓冲区）
                 cursor.connection.rollback()
                 
-                # 使用临时表去重插入（统一TEXT类型）
-                temp_table = f"temp_{table_name}_{id(batch) % 10000}"
-                cursor.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({primary_key} BIGINT, data TEXT) ON COMMIT DROP")
+                # 批量VALUES插入，ON CONFLICT DO NOTHING（不使用临时表）
+                inserted_count = 0
+                # 分小批次插入，每次最多1000条
+                chunk_size = 1000
+                for i in range(0, len(batch), chunk_size):
+                    chunk = batch[i:i + chunk_size]
+                    
+                    # 构建VALUES子句
+                    values_list = []
+                    for key_val, data in chunk:
+                        # 转义单引号
+                        escaped_data = data.replace("'", "''")
+                        values_list.append(f"({key_val}, '{escaped_data}', NOW(), NOW())")
+                    
+                    values_clause = ','.join(values_list)
+                    
+                    try:
+                        cursor.execute(f"""
+                            INSERT INTO {table_name} ({primary_key}, data, insert_time, update_time)
+                            VALUES {values_clause}
+                            ON CONFLICT ({primary_key}) DO NOTHING
+                        """)
+                        inserted_count += len(chunk)
+                    except Exception as e:
+                        # 如果VALUES也失败，跳过这个chunk
+                        logger.warning(f"VALUES插入失败，跳过{len(chunk)}条: {e}")
+                        continue
                 
-                # 重新构建buffer
-                buffer2 = StringIO()
-                lines2 = [f"{cid}\t{data}\n" for cid, data in batch]
-                buffer2.write(''.join(lines2))
-                buffer2.seek(0)
-                
-                # COPY到临时表
-                cursor.copy_expert(
-                    f"COPY {temp_table} ({primary_key}, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
-                    buffer2
-                )
-                
-                # 从临时表插入，跳过重复
-                cursor.execute(f"""
-                    INSERT INTO {table_name} ({primary_key}, data, insert_time, update_time)
-                    SELECT {primary_key}, data, NOW(), NOW() FROM {temp_table}
-                    ON CONFLICT ({primary_key}) DO NOTHING
-                """)
-                
-                return len(batch)
+                return inserted_count
         
     except psycopg2.errors.UniqueViolation:
         # 如果还是失败，说明事务已中止，需要外层处理
