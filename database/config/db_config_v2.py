@@ -25,7 +25,7 @@ DB_CONFIG = {
 
 TABLESPACE_CONFIG = {
     'enabled': True,
-    'name': 'D1_Tablespace',
+    'name': 'd1_tablespace',  # 小写，匹配PostgreSQL实际存储
     'location': 'E:\\postgreSQL',
 }
 
