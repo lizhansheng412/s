@@ -30,24 +30,47 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from database.config.db_config_v2 import DB_CONFIG, FIELD_TABLES
 
 # =============================================================================
-# 配置优化
+# 根据数据大小动态配置（关键优化！）
 # =============================================================================
 
-BATCH_SIZE = 150000                     # 更大批次，减少commit次数
-QUEUE_SIZE = 20                         # 队列容量（减小，节省内存）
-NUM_EXTRACTORS = 8                      # 解压进程数（推荐8个）
+# 针对TEXT类型优化配置（关键：控制磁盘IO，所有表commit<=800MB）
+TABLE_CONFIGS = {
+    # 超大数据 (60-120KB/条): s2orc系列 - 控制磁盘IO压力
+    's2orc': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 4},
+    's2orc_v2': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 4},
+    # 2000条×100KB=200MB/批，3批=600MB提交 ✓
+        
+    # 中等数据 (16KB/条): embeddings系列 - TEXT类型优化
+    'embeddings_specter_v1': {'batch_size': 10000, 'commit_batches': 3, 'extractors': 4},
+    'embeddings_specter_v2': {'batch_size': 10000, 'commit_batches': 3, 'extractors': 4},
+    # 10000条×16KB=160MB/批，3批=480MB提交
+    
+    # 小数据 (1-3KB/条): 其他表 - 大批次但控制总提交量
+    'papers': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'abstracts': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'authors': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'citations': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'paper_ids': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'publication_venues': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'tldrs': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    # 100000条×2KB=200MB/批，3批=600MB提交 ✓
+}
+
+DEFAULT_CONFIG = {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4}
+NUM_EXTRACTORS = 4  # USB磁盘优化：减少并发读取
+QUEUE_SIZE = 50  # USB磁盘优化：减少内存缓冲
 PROGRESS_FILE = 'logs/gz_progress.txt'
-COMMIT_BATCHES = 3                      # 每3个批次commit一次（减少commit开销）
 
 # 正则表达式：快速提取corpusid（比完整JSON解析快10倍）
 CORPUSID_PATTERN = re.compile(r'"corpusid"\s*:\s*(\d+)', re.IGNORECASE)
 
+# 设置日志级别为ERROR，只显示错误信息
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [%(processName)s] - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    level=logging.ERROR,
+    format='%(message)s'
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # 主进程可以INFO
 
 
 # =============================================================================
@@ -94,12 +117,17 @@ def extractor_worker(
     file_queue: Queue,
     data_queue: Queue,
     stats_dict: dict,
-    corpusid_key: str = 'corpusid'
+    corpusid_key: str = 'corpusid',
+    batch_size: int = 10000
 ):
     """
     解压工作进程（生产者）
     从file_queue取文件，解压后放入data_queue
     """
+    # 完全禁用此进程的日志输出
+    import logging
+    logging.getLogger().setLevel(logging.CRITICAL)
+    
     worker_name = f"Extractor-{id(file_queue) % 1000}"
     
     while True:
@@ -112,63 +140,63 @@ def extractor_worker(
             gz_file_path, file_name = task
             start_time = time.time()
             
-            logger.info(f"[{worker_name}] 🔄 解压: {file_name}")
-            
             try:
                 batch = []
                 line_count = 0
                 valid_count = 0
                 
-                # 流式解压
-                with gzip.open(gz_file_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        line_count += 1
-                        line = line.strip()
-                        if not line:
-                            continue
-                        
-                        # 正则快速提取corpusid（避免完整JSON解析）
-                        match = CORPUSID_PATTERN.search(line)
-                        if not match:
-                            continue
-                        
-                        corpusid = int(match.group(1))
-                        valid_count += 1
-                        
-                        # 零拷贝：直接使用原始JSON字符串
-                        # 转义特殊字符用于COPY
-                        json_escaped = line.replace('\\', '\\\\').replace('\n', '\\n').replace('\t', '\\t')
-                        
-                        batch.append((corpusid, json_escaped))
-                        
-                        # 批次满了，发送到队列
-                        if len(batch) >= BATCH_SIZE:
-                            data_queue.put(('data', file_name, batch))
-                            batch = []
-                
-                # 发送剩余数据
-                if batch:
-                    data_queue.put(('data', file_name, batch))
-                
-                # 发送文件完成信号
-                data_queue.put(('done', file_name, valid_count))
-                
-                elapsed = time.time() - start_time
-                rate = valid_count / elapsed if elapsed > 0 else 0
-                
-                logger.info(f"[{worker_name}] ✅ {file_name}: 提取 {valid_count:,} 条 ({rate:.0f}条/秒)")
-                
-                # 更新统计
-                stats_dict['extracted'] = stats_dict.get('extracted', 0) + valid_count
+                # 流式解压 - 遇到损坏直接跳过，不重试
+                try:
+                    with gzip.open(gz_file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                        for line in f:
+                            line_count += 1
+                            line = line.strip()
+                            if not line:
+                                continue
+                            
+                            # 正则快速提取corpusid（避免完整JSON解析）
+                            match = CORPUSID_PATTERN.search(line)
+                            if not match:
+                                continue
+                            
+                            corpusid = int(match.group(1))
+                            valid_count += 1
+                            
+                            # 优化：减少字符串操作
+                            # 检查是否需要转义（大多数情况不需要）
+                            if '\\' in line or '\n' in line or '\t' in line:
+                                json_escaped = line.replace('\\', '\\\\').replace('\n', '\\n').replace('\t', '\\t')
+                            else:
+                                json_escaped = line
+                            
+                            batch.append((corpusid, json_escaped))
+                            
+                            # 批次满了，发送到队列
+                            if len(batch) >= batch_size:
+                                data_queue.put(('data', file_name, batch))
+                                batch = []
+                    
+                    # 发送剩余数据
+                    if batch:
+                        data_queue.put(('data', file_name, batch))
+                    
+                    # 发送文件完成信号
+                    data_queue.put(('done', file_name, valid_count))
+                    
+                    # 更新统计
+                    stats_dict['extracted'] = stats_dict.get('extracted', 0) + valid_count
+                    
+                except (OSError, EOFError, ValueError) as gz_error:
+                    # GZIP文件损坏，直接跳过，不重试
+                    data_queue.put(('error', file_name, f"Corrupted"))
+                    continue
                 
             except Exception as e:
-                logger.error(f"[{worker_name}] ❌ {file_name}: {e}")
                 data_queue.put(('error', file_name, str(e)))
         
         except Empty:
             continue
-        except Exception as e:
-            logger.error(f"[{worker_name}] 异常: {e}")
+        except Exception:
             break
 
 
@@ -181,13 +209,15 @@ def inserter_worker(
     table_name: str,
     stats_dict: dict,
     tracker: ProgressTracker,
-    use_upsert: bool = False
+    use_upsert: bool = False,
+    commit_batches: int = 3,
+    total_files: int = 0
 ):
     """
     插入工作进程（消费者）
     持续从data_queue取数据并批量插入
     """
-    logger.info("[Inserter] 🚀 启动插入进程")
+    print("\n🚀 数据插入进程已启动\n")
     
     try:
         # 创建数据库连接
@@ -195,14 +225,23 @@ def inserter_worker(
         conn.autocommit = False
         cursor = conn.cursor()
         
+        # 性能优化配置（会话级别可修改的参数）
+        cursor.execute("SET synchronous_commit = OFF")  # 异步提交
+        cursor.execute("SET commit_delay = 100000")  # 延迟提交100ms
+        cursor.execute("SET maintenance_work_mem = '4GB'")  # 增大维护内存
+        cursor.execute("SET work_mem = '2GB'")  # 增大工作内存
+        cursor.execute("SET temp_buffers = '2GB'")  # 临时缓冲区
+        cursor.execute("SET effective_cache_size = '16GB'")  # 增大缓存
+        # 注意：wal_writer_delay 和 max_wal_size 需要在postgresql.conf中设置
+        
         # 禁用触发器（INSERT模式）
         if not use_upsert:
             cursor.execute(f"ALTER TABLE {table_name} DISABLE TRIGGER ALL")
             conn.commit()
-            logger.info("[Inserter] ✓ 触发器已禁用")
         
         total_inserted = 0
         file_stats = {}  # {file_name: inserted_count}
+        completed_files = 0
         last_log_time = time.time()
         start_time = time.time()
         batch_count = 0  # 批次计数器
@@ -221,36 +260,58 @@ def inserter_worker(
                 elif item_type == 'data':
                     _, file_name, batch = item
                     
-                    # 批量插入
-                    inserted = batch_insert_copy(cursor, table_name, batch, use_upsert)
-                    batch_count += 1
+                    try:
+                        # 批量插入
+                        inserted = batch_insert_copy(cursor, table_name, batch, use_upsert)
+                        batch_count += 1
+                        
+                        # 每N个批次commit一次，减少commit开销
+                        if batch_count >= commit_batches:
+                            conn.commit()
+                            batch_count = 0
+                        
+                        total_inserted += inserted
+                        file_stats[file_name] = file_stats.get(file_name, 0) + inserted
                     
-                    # 每N个批次commit一次，减少commit开销
-                    if batch_count >= COMMIT_BATCHES:
-                        conn.commit()
-                        batch_count = 0
-                    
-                    total_inserted += inserted
-                    file_stats[file_name] = file_stats.get(file_name, 0) + inserted
+                    except Exception as insert_error:
+                        # 插入失败，回滚当前事务
+                        conn.rollback()
+                        batch_count = 0  # 重置批次计数
+                        logger.error(f"批量插入失败（已回滚）: {insert_error}")
+                        # 跳过这个批次，继续处理下一个
+                        continue
                     
                     # 定期输出进度（每10秒）
                     current_time = time.time()
-                    if current_time - last_log_time >= 10:
+                    if current_time - last_log_time >= 3:
                         elapsed = current_time - start_time
                         rate = total_inserted / elapsed if elapsed > 0 else 0
-                        logger.info(f"[Inserter] 📊 已插入: {total_inserted:,} 条 ({rate:.0f}条/秒) | 队列: {data_queue.qsize()}")
+                        
+                        # 计算进度和预估时间
+                        progress_pct = (completed_files / total_files * 100) if total_files > 0 else 0
+                        remaining_files = total_files - completed_files
+                        eta_seconds = (remaining_files * elapsed / completed_files) if completed_files > 0 else 0
+                        eta_hours = int(eta_seconds / 3600)
+                        eta_mins = int((eta_seconds % 3600) / 60)
+                        eta_str = f"{eta_hours}h{eta_mins}m" if eta_hours > 0 else f"{eta_mins}分"
+                        
+                        print(f"\r📊 [{completed_files}/{total_files}] {progress_pct:.1f}% | "
+                              f"{total_inserted:,}条 | {rate:.0f}条/秒 | "
+                              f"剩余: {eta_str}    ", end='', flush=True)
                         last_log_time = current_time
                 
                 elif item_type == 'done':
                     _, file_name, _ = item
                     # 标记文件完成
                     tracker.mark_completed(file_name)
+                    completed_files += 1
                     inserted = file_stats.get(file_name, 0)
-                    logger.info(f"[Inserter] ✅ {file_name}: 已完成 ({inserted:,} 条)")
                 
                 elif item_type == 'error':
                     _, file_name, error = item
-                    logger.warning(f"[Inserter] ⚠️  {file_name}: 提取失败 - {error}")
+                    # 标记损坏文件为已完成，避免重复处理
+                    tracker.mark_completed(file_name)
+                    completed_files += 1
             
             except Empty:
                 # 队列空，继续等待
@@ -268,12 +329,11 @@ def inserter_worker(
         if not use_upsert:
             cursor.execute(f"ALTER TABLE {table_name} ENABLE TRIGGER ALL")
             conn.commit()
-            logger.info("[Inserter] ✓ 触发器已启用")
         
         elapsed = time.time() - start_time
         rate = total_inserted / elapsed if elapsed > 0 else 0
         
-        logger.info(f"\n[Inserter] 🏁 插入完成: {total_inserted:,} 条，平均 {rate:.0f} 条/秒\n")
+        print(f"\n\n✅ 插入完成: {total_inserted:,}条 | 平均速度: {rate:.0f}条/秒 | 用时: {elapsed/60:.1f}分钟\n")
         
         cursor.close()
         conn.close()
@@ -289,52 +349,100 @@ def inserter_worker(
 def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = False) -> int:
     """
     使用COPY批量插入（最快方法）
+    
+    数据以TEXT格式存储（不验证不解析，极速）
     """
     if not batch:
         return 0
     
+    from io import StringIO
+    import psycopg2.errors
+    
     try:
         if use_upsert:
-            # UPSERT模式
-            from io import StringIO
+            # UPSERT模式 - 优化版本
+            # 1. 批内去重（字典更快）
+            seen = {}
+            for corpusid, data in batch:
+                seen[corpusid] = data
+            
+            # 2. 构建buffer（一次性写入）
             buffer = StringIO()
-            for corpusid, json_str in batch:
-                buffer.write(f"{corpusid}\t{json_str}\n")
+            lines = [f"{cid}\t{data}\n" for cid, data in seen.items()]
+            buffer.write(''.join(lines))
             buffer.seek(0)
             
-            cursor.execute("CREATE TEMP TABLE IF NOT EXISTS temp_batch (corpusid BIGINT, data JSONB) ON COMMIT DROP")
+            # 3. 使用临时表UPSERT
+            temp_table = f"temp_{table_name}_{id(buffer)}"
+            cursor.execute(f"CREATE TEMP TABLE {temp_table} (corpusid BIGINT, data JSONB) ON COMMIT DROP")
             cursor.copy_expert(
-                "COPY temp_batch (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
+                f"COPY {temp_table} (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
                 buffer
             )
+            
+            # 4. 简化的UPSERT（去掉IS DISTINCT FROM检查，直接覆盖）
             cursor.execute(f"""
-                INSERT INTO {table_name} (corpusid, data)
-                SELECT corpusid, data FROM temp_batch
+                INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
+                SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
                 ON CONFLICT (corpusid) DO UPDATE SET
                     data = EXCLUDED.data,
-                    update_time = NOW()
-                WHERE {table_name}.data IS DISTINCT FROM EXCLUDED.data
+                    update_time = EXCLUDED.update_time
             """)
+            
+            return len(seen)
         else:
-            # INSERT模式：直接COPY（最快）
-            from io import StringIO
+            # INSERT模式：极速COPY（TEXT类型，不验证不解析，最快）
             buffer = StringIO()
-            for corpusid, json_str in batch:
-                buffer.write(f"{corpusid}\t{json_str}\t\\N\t\\N\n")
+            lines = [f"{cid}\t{data}\t\\N\t\\N\n" for cid, data in batch]
+            buffer.write(''.join(lines))
             buffer.seek(0)
             
-            cursor.copy_expert(
-                f"""
-                COPY {table_name} (corpusid, data, insert_time, update_time)
-                FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
-                """,
-                buffer
-            )
+            try:
+                cursor.copy_expert(
+                    f"""
+                    COPY {table_name} (corpusid, data, insert_time, update_time)
+                    FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
+                    """,
+                    buffer
+                )
+                return len(batch)
+            except psycopg2.errors.UniqueViolation:
+                # 有重复corpusid，回滚后用临时表+ON CONFLICT处理
+                cursor.connection.rollback()
+                
+                # 使用临时表去重插入（统一TEXT类型）
+                temp_table = f"temp_{table_name}_{id(batch) % 10000}"
+                cursor.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} (corpusid BIGINT, data TEXT) ON COMMIT DROP")
+                
+                # 重新构建buffer
+                buffer2 = StringIO()
+                lines2 = [f"{cid}\t{data}\n" for cid, data in batch]
+                buffer2.write(''.join(lines2))
+                buffer2.seek(0)
+                
+                # COPY到临时表
+                cursor.copy_expert(
+                    f"COPY {temp_table} (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
+                    buffer2
+                )
+                
+                # 从临时表插入，跳过重复
+                cursor.execute(f"""
+                    INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
+                    SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
+                    ON CONFLICT (corpusid) DO NOTHING
+                """)
+                
+                return len(batch)
         
-        return len(batch)
-        
+    except psycopg2.errors.UniqueViolation:
+        # 如果还是失败，说明事务已中止，需要外层处理
+        raise
     except Exception as e:
+        # 其他错误
+        import traceback
         logger.error(f"批量插入失败: {e}")
+        logger.error(f"详细信息: {traceback.format_exc()}")
         raise
 
 
@@ -379,12 +487,18 @@ def process_gz_folder_pipeline(
     logger.info(f"{'='*80}")
     logger.info(f"文件夹: {folder_path}")
     logger.info(f"目标表: {table_name}")
+    # 根据表名获取优化配置
+    config = TABLE_CONFIGS.get(table_name, DEFAULT_CONFIG)
+    batch_size = config['batch_size']
+    commit_batches = config['commit_batches']
+    # 如果用户没指定extractors，使用配置中的值
+    if num_extractors == NUM_EXTRACTORS:  # 默认值
+        num_extractors = config['extractors']
+    
     logger.info(f"总文件数: {len(gz_files)}")
     logger.info(f"已完成: {len(completed_files)}")
     logger.info(f"待处理: {len(pending_files)}")
-    logger.info(f"解压进程: {num_extractors}")
-    logger.info(f"批次大小: {BATCH_SIZE:,}")
-    logger.info(f"队列容量: {QUEUE_SIZE} 批次")
+    logger.info(f"优化配置: 批次={batch_size:,}, commit间隔={commit_batches}, 进程={num_extractors}")
     logger.info(f"模式: {'UPSERT' if use_upsert else 'INSERT (COPY)'}")
     logger.info(f"{'='*80}\n")
     
@@ -414,7 +528,7 @@ def process_gz_folder_pipeline(
         # 启动插入进程（消费者）
         inserter = Process(
             target=inserter_worker,
-            args=(data_queue, table_name, stats_dict, tracker, use_upsert),
+            args=(data_queue, table_name, stats_dict, tracker, use_upsert, commit_batches, len(pending_files)),
             name='Inserter'
         )
         inserter.start()
@@ -424,13 +538,13 @@ def process_gz_folder_pipeline(
         for i in range(num_extractors):
             p = Process(
                 target=extractor_worker,
-                args=(file_queue, data_queue, stats_dict, corpusid_key),
+                args=(file_queue, data_queue, stats_dict, corpusid_key, batch_size),
                 name=f'Extractor-{i+1}'
             )
             p.start()
             extractors.append(p)
         
-        logger.info(f"✓ 已启动 {num_extractors} 个解压进程 + 1 个插入进程\n")
+        print(f"✓ 已启动 {num_extractors} 个解压进程 + 1 个插入进程")
         
         # 等待所有解压进程完成
         for p in extractors:

@@ -26,7 +26,8 @@ def batch_process_machine(
     machine_id: str,
     base_dir: str,
     num_extractors: int = NUM_EXTRACTORS,
-    resume: bool = True
+    resume: bool = True,
+    use_upsert: bool = False  # 默认使用INSERT模式（更快）
 ):
     """
     批量处理该机器分配的所有文件夹
@@ -82,12 +83,12 @@ def batch_process_machine(
             continue
         
         try:
-            # 处理该文件夹
+            # 处理该文件夹（使用UPSERT避免重复键错误）
             process_gz_folder_pipeline(
                 folder_path=str(folder_path),
                 table_name=table_name,
                 corpusid_key='corpusid',
-                use_upsert=False,
+                use_upsert=use_upsert,
                 num_extractors=num_extractors,
                 resume=resume,
                 reset_progress=False
@@ -171,6 +172,8 @@ def main():
                        help=f'解压进程数（默认: {NUM_EXTRACTORS}）')
     parser.add_argument('--no-resume', action='store_true',
                        help='禁用断点续传（从头开始）')
+    parser.add_argument('--upsert', action='store_true',
+                       help='使用UPSERT模式（处理重复数据）')
     
     args = parser.parse_args()
     
@@ -178,7 +181,8 @@ def main():
         machine_id=args.machine,
         base_dir=args.base_dir,
         num_extractors=args.extractors,
-        resume=not args.no_resume
+        resume=not args.no_resume,
+        use_upsert=args.upsert
     )
 
 
