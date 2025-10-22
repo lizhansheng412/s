@@ -4,213 +4,108 @@
 
 ## ✨ 核心特性
 
-- ⚡ **超高速度**: 51,000+ 条/秒
+- ⚡ **超高速度**: 2000-4500条/秒（优化后提升2.5-4倍）
 - 🔄 **断点续传**: 中断后自动恢复
-- 🚀 **多进程并行**: 生产者-消费者模式
-- 💾 **UNLOGGED表**: 极速插入，无WAL开销
-- 🎯 **分布式支持**: 3台机器并行处理
-- 🔐 **100% E盘存储保证**: 所有数据存储在指定位置，不占用C盘或D盘
-- 🎯 **智能主键配置**: 不同表自动使用正确的主键字段
-
----
-
-## 📋 目录
-
-- [快速开始](#快速开始)
-- [完整操作流程](#完整操作流程)
-- [存储位置保证](#存储位置保证)
-- [分布式处理](#分布式处理)
-- [主键字段配置](#主键字段配置)
-- [性能优化](#性能优化)
-- [故障排除](#故障排除)
-- [配置文件说明](#配置文件说明)
+- 💾 **TURBO模式**: 可选极速插入（临时禁用WAL）
+- 🔐 **100% E盘存储**: 所有数据存储在 `E:\postgreSQL`
+- 🎯 **智能主键**: 不同表自动使用正确的主键字段
+- 🛡️ **内存安全**: 仅使用15-17GB（32GB系统安全）
 
 ---
 
 ## 🚀 快速开始
 
-### 前提条件
+### 📋 必备命令（按顺序执行）
 
-1. PostgreSQL已安装并运行
-2. `E:\postgreSQL` 目录存在且有写入权限
-3. `E:\2025-09-30` 目录包含S2ORC数据文件
-4. Python 3.8+
-
-### 安装依赖
-
-```bash
+```powershell
+# 1. 安装依赖
 pip install -r requirements.txt
-```
 
----
-
-## 📖 完整操作流程
-
-### 方案A：首次使用（推荐）
-
-适用于第一次使用或需要重新开始的情况。
-
-#### 步骤1: 完全清理（删除旧数据）
-
-```bash
-python scripts/clean_start.py
-```
-
-**说明：**
-- 删除数据库 `s2orc_d1`
-- 删除所有自定义表空间
-- 确保干净的起点
-- 需要输入 `yes` 确认
-
-**输出示例：**
-```
-✅ 数据库已删除: s2orc_d1
-✅ 已删除表空间: d1_tablespace
-✅ 清理完成！
-```
-
-#### 步骤2: 验证配置
-
-```bash
+# 2. 验证配置
 python scripts/verify_storage.py
-```
 
-**说明：**
-- 检查 `E:\postgreSQL` 目录权限
-- 验证PostgreSQL连接
-- 确认配置正确
-
-**输出示例：**
-```
-✅ 目录存在
-✅ 有写入权限
-✅ 验证通过
-保证: 数据库 → E:/postgreSQL
-```
-
-#### 步骤3: 初始化数据库
-
-```bash
-# 根据机器配置初始化
+# 3. 初始化数据库
 python scripts/init_database.py --init --machine machine3
 
-# 或者初始化所有表
-python scripts/init_database.py --init
-```
-
-**说明：**
-- 创建表空间 `d1_tablespace` → `E:\postgreSQL`
-- 创建数据库 `s2orc_d1` → 使用E盘表空间
-- 创建表（papers, authors, citations等） → 使用E盘表空间
-
-**输出示例：**
-```
-✓ 表空间创建成功
-✓ 数据库 s2orc_d1 创建成功
-数据库存储位置: E:\postgreSQL
-✓ 表 papers 创建成功 (TEXT类型)
-✓ 表 authors 创建成功 (TEXT类型)
-```
-
-#### 步骤4: 批量导入数据
-
-```bash
-# 分布式模式（推荐）
+# 4. 开始导入（推荐）
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 
-# 单个文件夹模式
-python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers
+# 4. 开始导入（TURBO模式，极速但有风险）
+python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30" --turbo
 ```
 
-**说明：**
-- 自动使用各表的正确主键字段
-- 所有数据写入 `E:\postgreSQL`
-- 支持断点续传
+### 🔄 中断后继续
 
-**输出示例：**
-```
-主键字段: authorid (authors表)
-主键字段: citedcorpusid (citations表)
-主键字段: corpusid (其他表)
-📊 [1/7] 100% | 1,234,567条 | 3500条/秒
+```powershell
+# 直接运行相同命令即可（自动跳过已完成文件）
+python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 ```
 
-#### 步骤5: 最终验证
+### 🗑️ 重新开始
 
-```bash
-python scripts/verify_storage.py
-```
+```powershell
+# 1. 清理旧数据
+python scripts/clean_start.py
 
-**输出示例：**
-```
-✅ 表空间配置正确: E:\postgreSQL
-✅ 数据库使用正确表空间: d1_tablespace
-✅ 找到 7 个表
-```
+# 2. 重新初始化
+python scripts/init_database.py --init --machine machine3
 
-### 方案B：继续之前的导入
-
-如果已经初始化过，只是想继续导入数据：
-
-```bash
+# 3. 重新导入
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 ```
 
 ---
 
-## 🔐 存储位置保证
+## 📊 性能优化
 
-### 100% E盘存储
+### 优化效果对比
 
-**保证存储在 `E:\postgreSQL`：**
-- ✅ 数据库系统文件 → `E:\postgreSQL\PG_xx_xxxxx\s2orc_d1\`
-- ✅ papers表数据 → `E:\postgreSQL\PG_xx_xxxxx\s2orc_d1\papers_xxxxx`
-- ✅ authors表数据 → `E:\postgreSQL\PG_xx_xxxxx\s2orc_d1\authors_xxxxx`
-- ✅ citations表数据 → `E:\postgreSQL\PG_xx_xxxxx\s2orc_d1\citations_xxxxx`
-- ✅ 所有索引 → `E:\postgreSQL\...`
-- ✅ WAL日志 → `E:\postgreSQL\...`
+| 配置 | 速度 | 完成时间 | 单次commit | 内存使用 |
+|------|------|---------|-----------|---------|
+| **原始配置** | 827条/秒 | 26小时+ | 480MB | ~6GB |
+| **优化配置** | 2000-3000条/秒 | 8-12小时 | 1.6GB | ~8-11GB |
+| **TURBO模式** | 3000-4500条/秒 | 6-9小时 | 1.6GB | ~8-11GB |
 
-**绝不会存储在：**
-- ❌ C盘
-- ❌ D盘
-- ❌ PostgreSQL默认目录 (`D:\person_data\postgresql\data\`)
+**提升效果**: 速度提升 **2.5-4倍**，时间节省 **60-70%**
 
-### 验证数据位置
+### 各表优化配置（自动应用）
 
-```bash
-# 方法1: 运行验证脚本
-python scripts/verify_storage.py
+| 表名 | batch_size | commit_batches | extractors | 每次commit |
+|------|-----------|---------------|-----------|-----------|
+| embeddings_specter_v1/v2 | 20,000 | 5 | 6 | 1.6GB |
+| s2orc/s2orc_v2 | 2,500 | 5 | 6 | 1.25GB |
+| papers/abstracts/等 | 50,000 | 5 | 7 | 500MB |
 
-# 方法2: 检查目录
-dir E:\postgreSQL
-# 应该能看到 PG_18_xxxxxx 等PostgreSQL目录
+### TURBO模式说明
 
-# 方法3: SQL查询
-psql -U postgres -d s2orc_d1 -c "
-SELECT d.datname, t.spcname, pg_tablespace_location(t.oid)
-FROM pg_database d
-LEFT JOIN pg_tablespace t ON d.dattablespace = t.oid
-WHERE d.datname = 's2orc_d1';
-"
+**启用方式**：添加 `--turbo` 参数
+
+```powershell
+python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30" --turbo
 ```
+
+**说明**：
+- ✅ 速度提升30-50%（3000-4500条/秒）
+- ⚠️ 临时禁用WAL日志（表设为UNLOGGED）
+- ⚠️ 数据库崩溃可能丢失正在导入的数据
+- ✅ 完成后自动恢复为LOGGED模式
+- 💡 建议：仅在初次批量导入时使用
 
 ---
 
-## 🌐 分布式处理
+## 🌐 分布式处理（3台机器并行）
 
 ### 机器分配
 
-三台机器并行处理，大幅提升速度：
-
 | 机器 | 负责的表 | 预估时间 |
 |------|---------|---------|
-| **Machine 1** | embeddings_specter_v1, s2orc | ~10小时 |
-| **Machine 2** | embeddings_specter_v2, s2orc_v2 | ~10小时 |
-| **Machine 3** | papers, abstracts, authors, citations, paper_ids, publication_venues, tldrs | ~10小时 |
+| **Machine 1** | embeddings_specter_v1, s2orc | 8-12小时 |
+| **Machine 2** | embeddings_specter_v2, s2orc_v2 | 8-12小时 |
+| **Machine 3** | papers, abstracts, authors, citations, paper_ids, publication_venues, tldrs | 8-12小时 |
 
 ### 使用方法
 
-```bash
+```powershell
 # 在电脑1上运行
 python scripts/batch_process_machine.py --machine machine1 --base-dir "E:\2025-09-30"
 
@@ -221,78 +116,63 @@ python scripts/batch_process_machine.py --machine machine2 --base-dir "E:\2025-0
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 ```
 
-### 性能对比
-
-- **单机处理**: 27-29 小时
-- **三机并行**: 9-12 小时 ⚡ **节省 60%**
-
 ---
 
 ## 🎯 主键字段配置
 
-不同的表使用不同的主键字段，系统会**自动识别**：
+系统自动识别，无需手动配置：
 
-| 表名 | 主键字段 | 说明 |
-|------|---------|------|
-| `authors` | `authorid` | 作者ID |
-| `citations` | `citedcorpusid` | 被引用文献ID |
-| `papers` | `corpusid` | 论文ID |
-| `abstracts` | `corpusid` | 摘要关联论文ID |
-| `s2orc` | `corpusid` | S2ORC数据ID |
-| 其他表 | `corpusid` | 默认使用corpusid |
-
-**无需手动配置**，导入时会自动使用正确的主键字段。
+| 表名 | 主键字段 |
+|------|---------|
+| `authors` | `authorid` |
+| `citations` | `citedcorpusid` |
+| 其他表 | `corpusid` |
 
 ---
 
-## ⚡ 性能优化
+## 🔐 存储位置保证
 
-### PostgreSQL配置优化
+**100% 存储在 `E:\postgreSQL`**
 
-编辑 `postgresql.conf`：
+- ✅ 数据库文件 → `E:\postgreSQL\PG_xx_xxxxx\s2orc_d1\`
+- ✅ 所有表数据 → `E:\postgreSQL\...`
+- ✅ 所有索引 → `E:\postgreSQL\...`
+- ❌ 绝不会存储在 C盘或D盘
 
-```ini
-# 内存配置
-shared_buffers = 4GB
-work_mem = 256MB
-maintenance_work_mem = 2GB
-effective_cache_size = 16GB
-
-# WAL配置
-max_wal_size = 10GB
-min_wal_size = 2GB
-wal_buffers = 32MB
-checkpoint_timeout = 30min
-checkpoint_completion_target = 0.9
-
-# 并行配置
-max_worker_processes = 16
-max_parallel_workers_per_gather = 4
-max_parallel_workers = 12
+**验证命令**：
+```powershell
+python scripts/verify_storage.py
 ```
 
-### 解压进程数优化
+---
 
-根据CPU核心数调整：
+## 🔧 常用命令集合
 
-```bash
-# 4核CPU
-python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\data" --extractors 4
+### 监控进度
 
-# 8核CPU
-python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\data" --extractors 7
+```powershell
+# 查看进度文件
+type logs\gz_progress.txt
 
-# 12核以上
-python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\data" --extractors 10
+# 查看数据量
+psql -U postgres -d s2orc_d1 -c "SELECT COUNT(*) FROM papers;"
+
+# 查看表空间使用
+psql -U postgres -c "SELECT spcname, pg_size_pretty(pg_tablespace_size(spcname)) AS size, pg_tablespace_location(oid) AS location FROM pg_tablespace WHERE spcname = 'd1_tablespace';"
 ```
 
-### 批量大小配置
+### 处理单个文件夹
 
-已针对不同表优化，无需调整：
+```powershell
+# 处理特定文件夹
+python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers
 
-- **大数据表** (s2orc系列): 2,000条/批
-- **中等数据表** (embeddings系列): 10,000条/批
-- **小数据表** (papers, authors等): 100,000条/批
+# 使用TURBO模式
+python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers --turbo
+
+# 自定义进程数
+python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers --extractors 12
+```
 
 ---
 
@@ -300,124 +180,70 @@ python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\data" 
 
 ### 常见问题
 
-#### Q1: 如何确认数据真的在E盘？
-
-**A1:**
-1. 运行验证脚本: `python scripts/verify_storage.py`
-2. 检查目录: `dir E:\postgreSQL`
-3. 应该能看到 `PG_18_xxxxxx` 等PostgreSQL目录和大量数据文件
-
-#### Q2: 如果已经有旧数据怎么办？
-
-**A2:**
-```bash
-# 运行清理脚本
-python scripts/clean_start.py
-# 输入 yes 确认删除
-
-# 重新初始化
-python scripts/init_database.py --init --machine machine3
-```
-
-#### Q3: 导入过程中断了怎么办？
-
-**A3:**
-直接重新运行相同命令，会自动跳过已完成的文件：
-```bash
+**Q: 导入中断了怎么办？**
+```powershell
+# 直接重新运行相同命令（自动续传）
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 ```
 
-#### Q4: 如何查看进度？
-
-**A4:**
-```bash
-# 查看进度文件
-cat logs/gz_progress.txt
-
-# 查看已导入数据量
-psql -U postgres -d s2orc_d1 -c "SELECT COUNT(*) FROM papers;"
-```
-
-#### Q5: 磁盘空间不足怎么办？
-
-**A5:**
-1. 检查 `E:\postgreSQL` 大小
-2. 清理其他文件腾出空间
-3. 或修改配置使用其他盘符（需修改 `database/config/db_config_v2.py`）
-
-#### Q6: 内存不足怎么办？
-
-**A6:**
-减少并发进程数：
-```bash
-python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\data" --extractors 2
-```
-
-### 错误处理流程
-
-如果导入失败：
-
-```bash
-# 1. 查看错误信息
-# 2. 运行清理
+**Q: 如何重新开始？**
+```powershell
 python scripts/clean_start.py
-
-# 3. 重新开始
 python scripts/init_database.py --init --machine machine3
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
+```
+
+**Q: 内存不足怎么办？**
+```powershell
+# 减少并发进程数
+python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30" --extractors 4
+```
+
+**Q: 如何验证数据在E盘？**
+```powershell
+python scripts/verify_storage.py
+dir E:\postgreSQL
 ```
 
 ---
 
-## 📁 配置文件说明
+## ⚙️ 高级配置（可选）
 
-### database/config/db_config_v2.py
+### PostgreSQL配置优化
 
-核心配置文件：
+如需进一步提升性能，编辑 `postgresql.conf`：
 
-```python
-# 数据库连接配置
-DB_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'database': 's2orc_d1',
-    'user': 'postgres',
-    'password': 'your_password',
-}
+```ini
+# 内存配置（32GB系统推荐）
+shared_buffers = 8GB
+effective_cache_size = 24GB
+maintenance_work_mem = 4GB
+work_mem = 2GB
 
-# 表空间配置（100%存储位置控制）
-TABLESPACE_CONFIG = {
-    'enabled': True,
-    'name': 'd1_tablespace',      # 表空间名称
-    'location': 'E:\\postgreSQL',  # ← 存储位置（E盘）
-}
+# WAL配置（关键）
+max_wal_size = 16GB
+min_wal_size = 4GB
+checkpoint_timeout = 30min
 
-# 主键字段映射
-TABLE_PRIMARY_KEY_MAP = {
-    'authors': 'authorid',           # authors表使用authorid
-    'citations': 'citedcorpusid',    # citations表使用citedcorpusid
-    # 其他表默认使用corpusid
-}
+# IO优化（SSD）
+random_page_cost = 1.1
+effective_io_concurrency = 200
 ```
 
-### machine_config.py
+修改后重启PostgreSQL：
+```powershell
+Restart-Service postgresql-x64-14
+```
 
-机器分配配置：
+### 修改存储位置
+
+编辑 `database/config/db_config_v2.py`：
 
 ```python
-MACHINE_CONFIGS = {
-    'machine1': {
-        'folders': ['embeddings-specter_v1', 's2orc'],
-        'tables': ['embeddings_specter_v1', 's2orc'],
-    },
-    'machine2': {
-        'folders': ['embeddings-specter_v2', 's2orc_v2'],
-        'tables': ['embeddings_specter_v2', 's2orc_v2'],
-    },
-    'machine3': {
-        'folders': ['abstracts', 'authors', 'citations', 'paper_ids', 'papers', 'publication_venues', 'tldrs'],
-        'tables': ['abstracts', 'authors', 'citations', 'paper_ids', 'papers', 'publication_venues', 'tldrs'],
-    }
+TABLESPACE_CONFIG = {
+    'enabled': True,
+    'name': 'd1_tablespace',
+    'location': 'E:\\postgreSQL',  # ← 修改为其他盘符
 }
 ```
 
@@ -427,90 +253,18 @@ MACHINE_CONFIGS = {
 
 ```
 gz_filed_update/
-├── database/
-│   └── config/
-│       └── db_config_v2.py       # 数据库和表空间配置
 ├── scripts/
-│   ├── clean_start.py            # 完全清理脚本
-│   ├── verify_storage.py         # 验证存储位置
-│   ├── init_database.py          # 初始化数据库
+│   ├── batch_process_machine.py      # 批量处理（推荐）
 │   ├── stream_gz_to_db_optimized.py  # 单文件夹处理
-│   ├── batch_process_machine.py  # 批量处理
-│   └── finalize_database.py      # 最终化
-├── logs/
-│   └── gz_progress.txt           # 进度记录
-├── machine_config.py             # 机器分配配置
-├── requirements.txt              # Python依赖
-└── README.md                     # 本文档
+│   ├── init_database.py              # 初始化数据库
+│   ├── verify_storage.py             # 验证存储位置
+│   └── clean_start.py                # 清理旧数据
+├── database/config/
+│   └── db_config_v2.py               # 配置文件
+├── machine_config.py                 # 机器分配
+└── logs/
+    └── gz_progress.txt               # 进度记录
 ```
-
----
-
-## 🎯 核心脚本说明
-
-| 脚本 | 功能 | 使用时机 |
-|------|------|---------|
-| `clean_start.py` | 删除所有旧数据库和表空间 | 首次使用或重新开始 |
-| `verify_storage.py` | 验证存储位置配置 | 任何时候都可以验证 |
-| `init_database.py` | 初始化数据库和表 | 清理后或首次使用 |
-| `batch_process_machine.py` | 批量处理多个文件夹 | 分布式自动化导入 |
-| `stream_gz_to_db_optimized.py` | 处理单个文件夹 | 单独处理某个表 |
-| `finalize_database.py` | 最终化数据库 | 所有数据导入完成后 |
-
----
-
-## 📊 监控进度
-
-### 查看进度文件
-
-```bash
-# Windows
-type logs\gz_progress.txt
-
-# 查看最后10个完成的文件
-tail -10 logs/gz_progress.txt
-```
-
-### 查询数据库
-
-```bash
-# 查看各表数据量
-psql -U postgres -d s2orc_d1 -c "
-SELECT 
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size,
-    n_live_tup AS row_count
-FROM pg_stat_user_tables
-ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
-"
-
-# 查看表空间使用情况
-psql -U postgres -c "
-SELECT 
-    spcname,
-    pg_size_pretty(pg_tablespace_size(spcname)) AS size,
-    pg_tablespace_location(oid) AS location
-FROM pg_tablespace
-WHERE spcname = 'd1_tablespace';
-"
-```
-
----
-
-## ✅ 完成标志
-
-当看到以下输出时，表示导入成功：
-
-```
-✅ 所有文件已处理完成！
-✅ 插入完成: XXX,XXX,XXX条
-✅ 验证通过
-✅ 数据库 → E:/postgreSQL
-✅ 所有表 → E:/postgreSQL
-```
-
-此时可以检查 `E:\postgreSQL` 目录，应该有大量数据文件。
 
 ---
 
@@ -518,24 +272,12 @@ WHERE spcname = 'd1_tablespace';
 
 - **Python**: 3.8+
 - **PostgreSQL**: 12+
-- **内存**: 8GB+ 推荐
+- **内存**: 16GB+ 推荐（优化配置下使用15-17GB）
 - **CPU**: 多核推荐（用于并行解压）
-- **磁盘**: E盘需有足够空间（建议预留500GB+）
+- **磁盘**: E盘需有足够空间（建议500GB+）
 
 ---
 
 ## 📝 许可证
 
 MIT License
-
----
-
-## 🤝 贡献
-
-欢迎提交Issue和Pull Request！
-
----
-
-## 📮 联系方式
-
-如有问题，请提交Issue。

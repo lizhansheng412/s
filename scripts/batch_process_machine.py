@@ -27,7 +27,8 @@ def batch_process_machine(
     base_dir: str,
     num_extractors: int = NUM_EXTRACTORS,
     resume: bool = True,
-    use_upsert: bool = False  # 默认使用INSERT模式（更快）
+    use_upsert: bool = False,  # 默认使用INSERT模式（更快）
+    turbo_mode: bool = False  # TURBO模式（极速但有风险）
 ):
     """
     批量处理该机器分配的所有文件夹
@@ -54,6 +55,8 @@ def batch_process_machine(
         logger.info(f"  - {folder} → {table}")
     logger.info(f"解压进程数: {num_extractors}")
     logger.info(f"断点续传: {'启用' if resume else '禁用'}")
+    if turbo_mode:
+        logger.warning(f"⚠️  TURBO模式: 已启用（表将临时设为UNLOGGED，提升性能但有风险）")
     logger.info("="*80)
     logger.info("")
     
@@ -90,7 +93,8 @@ def batch_process_machine(
                 use_upsert=use_upsert,
                 num_extractors=num_extractors,
                 resume=resume,
-                reset_progress=False
+                reset_progress=False,
+                turbo_mode=turbo_mode
             )
             
             success_count += 1
@@ -173,6 +177,8 @@ def main():
                        help='禁用断点续传（从头开始）')
     parser.add_argument('--upsert', action='store_true',
                        help='使用UPSERT模式（处理重复数据）')
+    parser.add_argument('--turbo', action='store_true',
+                       help='启用TURBO模式（临时将表设为UNLOGGED，极速但有风险）')
     
     args = parser.parse_args()
     
@@ -181,7 +187,8 @@ def main():
         base_dir=args.base_dir,
         num_extractors=args.extractors,
         resume=not args.no_resume,
-        use_upsert=args.upsert
+        use_upsert=args.upsert,
+        turbo_mode=args.turbo
     )
 
 

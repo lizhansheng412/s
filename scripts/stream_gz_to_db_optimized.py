@@ -37,33 +37,36 @@ from database.config.db_config_v2 import DB_CONFIG, FIELD_TABLES
 # 根据数据大小动态配置（关键优化！）
 # =============================================================================
 
-# 针对TEXT类型优化配置（关键：控制磁盘IO，所有表commit<=800MB）
+# 针对TEXT类型优化配置（平衡：性能 vs 内存安全，单次commit不超过2GB）
 TABLE_CONFIGS = {
-    # 超大数据 (60-120KB/条): s2orc系列 - 控制磁盘IO压力
-    's2orc': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 4},
-    's2orc_v2': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 4},
-    # 2000条×100KB=200MB/批，3批=600MB提交 ✓
+    # 超大数据 (60-120KB/条): s2orc系列 - 控制内存使用
+    's2orc': {'batch_size': 2500, 'commit_batches': 5, 'extractors': 6},
+    's2orc_v2': {'batch_size': 2500, 'commit_batches': 5, 'extractors': 6},
+    # 2500条×100KB=250MB/批，5批=1.25GB提交 ✓
         
-    # 中等数据 (16KB/条): embeddings系列 - TEXT类型优化
-    'embeddings_specter_v1': {'batch_size': 10000, 'commit_batches': 3, 'extractors': 4},
-    'embeddings_specter_v2': {'batch_size': 10000, 'commit_batches': 3, 'extractors': 4},
-    # 10000条×16KB=160MB/批，3批=480MB提交
+    # 中等数据 (16KB/条): embeddings系列 - 平衡优化（关键：单次commit ~1.6GB）
+    'embeddings_specter_v1': {'batch_size': 20000, 'commit_batches': 5, 'extractors': 6},
+    'embeddings_specter_v2': {'batch_size': 20000, 'commit_batches': 5, 'extractors': 6},
+    # 20000条×16KB=320MB/批，5批=1.6GB提交（安全范围内的大批次）
     
-    # 小数据 (1-3KB/条): 其他表 - 大批次但控制总提交量
-    'papers': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    'abstracts': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    'authors': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    'citations': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    'paper_ids': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    'publication_venues': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    'tldrs': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
-    # 100000条×2KB=200MB/批，3批=600MB提交 ✓
+    # 小数据 (1-3KB/条): 其他表 - 减小batch避免缓冲区耗尽
+    'papers': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    'abstracts': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    'authors': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    'citations': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    'paper_ids': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    'publication_venues': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    'tldrs': {'batch_size': 50000, 'commit_batches': 5, 'extractors': 7},
+    # 50000条×2KB=100MB/批，5批=500MB提交（避免缓冲区耗尽）
 }
 
-DEFAULT_CONFIG = {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4}
-NUM_EXTRACTORS = 4  # USB磁盘优化：减少并发读取
-QUEUE_SIZE = 50  # USB磁盘优化：减少内存缓冲
+DEFAULT_CONFIG = {'batch_size': 100000, 'commit_batches': 5, 'extractors': 6}
+NUM_EXTRACTORS = 6  # 默认解压进程数（已优化）
+QUEUE_SIZE = 80  # 队列大小：增大缓冲（已优化）
 PROGRESS_FILE = 'logs/gz_progress.txt'
+
+# 性能提升模式（警告：TURBO模式会禁用WAL日志，数据库崩溃时可能丢失数据）
+TURBO_MODE = False  # 设置为True启用极速模式（仅建议初次批量导入时使用）
 
 # 不同表使用不同的主键字段
 TABLE_PRIMARY_KEY_MAP = {
@@ -179,14 +182,9 @@ def extractor_worker(
                             key_value = int(match.group(1))
                             valid_count += 1
                             
-                            # 优化：减少字符串操作
-                            # 检查是否需要转义（大多数情况不需要）
-                            if '\\' in line or '\n' in line or '\t' in line:
-                                json_escaped = line.replace('\\', '\\\\').replace('\n', '\\n').replace('\t', '\\t')
-                            else:
-                                json_escaped = line
-                            
-                            batch.append((key_value, json_escaped))
+                            # 优化：直接使用原始行，避免不必要的转义检查
+                            # PostgreSQL COPY可以处理大多数JSON字符
+                            batch.append((key_value, line))
                             
                             # 批次满了，发送到队列
                             if len(batch) >= batch_size:
@@ -228,11 +226,16 @@ def inserter_worker(
     tracker: ProgressTracker,
     use_upsert: bool = False,
     commit_batches: int = 3,
-    total_files: int = 0
+    total_files: int = 0,
+    turbo_mode: bool = False,
+    primary_key: str = 'corpusid'
 ):
     """
     插入工作进程（消费者）
     持续从data_queue取数据并批量插入
+    
+    Args:
+        primary_key: 主键字段名（默认corpusid）
     """
     print("\n🚀 数据插入进程已启动\n")
     
@@ -242,19 +245,44 @@ def inserter_worker(
         conn.autocommit = False
         cursor = conn.cursor()
         
-        # 性能优化配置（会话级别可修改的参数）
-        cursor.execute("SET synchronous_commit = OFF")  # 异步提交
-        cursor.execute("SET commit_delay = 100000")  # 延迟提交100ms
-        cursor.execute("SET maintenance_work_mem = '4GB'")  # 增大维护内存
-        cursor.execute("SET work_mem = '2GB'")  # 增大工作内存
-        cursor.execute("SET temp_buffers = '2GB'")  # 临时缓冲区
-        cursor.execute("SET effective_cache_size = '16GB'")  # 增大缓存
-        # 注意：wal_writer_delay 和 max_wal_size 需要在postgresql.conf中设置
+        # 性能优化配置（平衡：性能 vs 内存安全）
+        try:
+            cursor.execute("SET synchronous_commit = OFF")  # 异步提交（关键优化）
+            cursor.execute("SET commit_delay = 100000")  # 延迟提交100ms（PostgreSQL最大值）
+            cursor.execute("SET maintenance_work_mem = '4GB'")  # 维护内存（安全值）
+            cursor.execute("SET work_mem = '2GB'")  # 工作内存（安全值）
+            cursor.execute("SET temp_buffers = '4GB'")  # 临时缓冲区（增大，避免耗尽）
+            cursor.execute("SET effective_cache_size = '24GB'")  # 缓存大小（假设系统32GB内存）
+            cursor.execute("SET max_parallel_workers_per_gather = 0")  # 关闭并行（批量插入不需要）
+        except Exception as e:
+            conn.rollback()  # 回滚失败的设置
+            logger.warning(f"部分性能配置失败（可忽略）: {e}")
+        
+        # WAL设置（可能失败，单独处理）
+        try:
+            cursor.execute("SET wal_writer_delay = '1000ms'")
+        except Exception:
+            conn.rollback()  # 回滚并继续
+        
+        # TURBO模式：临时禁用WAL（极速但有风险）
+        if turbo_mode and not use_upsert:
+            print("⚠️  TURBO模式已启用 - 表将临时设为UNLOGGED（数据库崩溃可能丢失数据）")
+            try:
+                cursor.execute(f"ALTER TABLE {table_name} SET UNLOGGED")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()  # 关键：回滚失败的事务
+                print(f"⚠️  无法启用UNLOGGED模式: {e}")
+                print("⚠️  继续使用LOGGED模式（性能会稍慢）")
         
         # 禁用触发器（INSERT模式）
         if not use_upsert:
-            cursor.execute(f"ALTER TABLE {table_name} DISABLE TRIGGER ALL")
-            conn.commit()
+            try:
+                cursor.execute(f"ALTER TABLE {table_name} DISABLE TRIGGER ALL")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"禁用触发器失败（可忽略）: {e}")
         
         total_inserted = 0
         file_stats = {}  # {file_name: inserted_count}
@@ -278,8 +306,8 @@ def inserter_worker(
                     _, file_name, batch = item
                     
                     try:
-                        # 批量插入
-                        inserted = batch_insert_copy(cursor, table_name, batch, use_upsert)
+                        # 批量插入（传入主键字段）
+                        inserted = batch_insert_copy(cursor, table_name, batch, use_upsert, primary_key)
                         batch_count += 1
                         
                         # 每N个批次commit一次，减少commit开销
@@ -342,8 +370,19 @@ def inserter_worker(
         if batch_count > 0:
             conn.commit()
         
-        # 启用触发器
+        # 恢复表状态
         if not use_upsert:
+            # 恢复LOGGED状态（如果之前设为UNLOGGED）
+            if turbo_mode:
+                print("\n🔄 恢复表为LOGGED状态...")
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} SET LOGGED")
+                    conn.commit()
+                    print("✅ 表已恢复LOGGED状态")
+                except Exception as e:
+                    print(f"⚠️  恢复LOGGED失败: {e}")
+            
+            # 启用触发器
             cursor.execute(f"ALTER TABLE {table_name} ENABLE TRIGGER ALL")
             conn.commit()
         
@@ -363,11 +402,23 @@ def inserter_worker(
         traceback.print_exc()
 
 
-def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = False) -> int:
+def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = False, primary_key: str = 'corpusid') -> int:
     """
     使用COPY批量插入（最快方法）
     
     数据以TEXT格式存储（不验证不解析，极速）
+    
+    注意：
+    - 所有表的主键列名都是corpusid（表结构统一）
+    - primary_key参数仅用于标识，实际SQL都使用corpusid
+    - batch中的key_value是从JSON不同字段提取的（authorid/citedcorpusid/corpusid）
+    
+    Args:
+        cursor: 数据库游标
+        table_name: 表名
+        batch: 数据批次 [(key_value, json_line), ...] - key_value已从JSON正确字段提取
+        use_upsert: 是否使用UPSERT模式
+        primary_key: 标识字段名（仅用于日志，SQL固定用corpusid）
     """
     if not batch:
         return 0
@@ -380,16 +431,16 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
             # UPSERT模式 - 优化版本
             # 1. 批内去重（字典更快）
             seen = {}
-            for corpusid, data in batch:
-                seen[corpusid] = data
+            for key_value, data in batch:
+                seen[key_value] = data
             
             # 2. 构建buffer（一次性写入）
             buffer = StringIO()
-            lines = [f"{cid}\t{data}\n" for cid, data in seen.items()]
+            lines = [f"{key_val}\t{data}\n" for key_val, data in seen.items()]
             buffer.write(''.join(lines))
             buffer.seek(0)
             
-            # 3. 使用临时表UPSERT
+            # 3. 使用临时表UPSERT（所有表的主键列都叫corpusid）
             temp_table = f"temp_{table_name}_{id(buffer)}"
             cursor.execute(f"CREATE TEMP TABLE {temp_table} (corpusid BIGINT, data JSONB) ON COMMIT DROP")
             cursor.copy_expert(
@@ -397,7 +448,7 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
                 buffer
             )
             
-            # 4. 简化的UPSERT（去掉IS DISTINCT FROM检查，直接覆盖）
+            # 4. 简化的UPSERT（主键列固定是corpusid）
             cursor.execute(f"""
                 INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
                 SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
@@ -417,19 +468,19 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
             try:
                 cursor.copy_expert(
                     f"""
-                    COPY {table_name} (corpusid, data, insert_time, update_time)
+                    COPY {table_name} ({primary_key}, data, insert_time, update_time)
                     FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
                     """,
                     buffer
                 )
                 return len(batch)
             except psycopg2.errors.UniqueViolation:
-                # 有重复corpusid，回滚后用临时表+ON CONFLICT处理
+                # 有重复key，回滚后用临时表+ON CONFLICT处理
                 cursor.connection.rollback()
                 
                 # 使用临时表去重插入（统一TEXT类型）
                 temp_table = f"temp_{table_name}_{id(batch) % 10000}"
-                cursor.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} (corpusid BIGINT, data TEXT) ON COMMIT DROP")
+                cursor.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({primary_key} BIGINT, data TEXT) ON COMMIT DROP")
                 
                 # 重新构建buffer
                 buffer2 = StringIO()
@@ -439,15 +490,15 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
                 
                 # COPY到临时表
                 cursor.copy_expert(
-                    f"COPY {temp_table} (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
+                    f"COPY {temp_table} ({primary_key}, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
                     buffer2
                 )
                 
                 # 从临时表插入，跳过重复
                 cursor.execute(f"""
-                    INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
-                    SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
-                    ON CONFLICT (corpusid) DO NOTHING
+                    INSERT INTO {table_name} ({primary_key}, data, insert_time, update_time)
+                    SELECT {primary_key}, data, NOW(), NOW() FROM {temp_table}
+                    ON CONFLICT ({primary_key}) DO NOTHING
                 """)
                 
                 return len(batch)
@@ -473,7 +524,8 @@ def process_gz_folder_pipeline(
     use_upsert: bool = False,
     num_extractors: int = NUM_EXTRACTORS,
     resume: bool = True,
-    reset_progress: bool = False
+    reset_progress: bool = False,
+    turbo_mode: bool = False
 ):
     """
     流水线并行处理：多个解压进程 + 单个插入进程
@@ -520,6 +572,8 @@ def process_gz_folder_pipeline(
     logger.info(f"待处理: {len(pending_files)}")
     logger.info(f"优化配置: 批次={batch_size:,}, commit间隔={commit_batches}, 进程={num_extractors}")
     logger.info(f"模式: {'UPSERT' if use_upsert else 'INSERT (COPY)'}")
+    if turbo_mode:
+        logger.warning(f"⚠️  TURBO模式: 已启用（表将临时设为UNLOGGED，提升性能但有风险）")
     logger.info(f"{'='*80}\n")
     
     if not pending_files:
@@ -548,7 +602,7 @@ def process_gz_folder_pipeline(
         # 启动插入进程（消费者）
         inserter = Process(
             target=inserter_worker,
-            args=(data_queue, table_name, stats_dict, tracker, use_upsert, commit_batches, len(pending_files)),
+            args=(data_queue, table_name, stats_dict, tracker, use_upsert, commit_batches, len(pending_files), turbo_mode, primary_key_field),
             name='Inserter'
         )
         inserter.start()
@@ -653,6 +707,8 @@ def main():
                        help='启用断点续传')
     parser.add_argument('--reset', action='store_true',
                        help='重置进度')
+    parser.add_argument('--turbo', action='store_true',
+                       help='启用TURBO模式（临时将表设为UNLOGGED，极速但有风险）')
     
     parser.set_defaults(resume=True)
     
@@ -665,7 +721,8 @@ def main():
         use_upsert=args.upsert,
         num_extractors=args.extractors,
         resume=args.resume,
-        reset_progress=args.reset
+        reset_progress=args.reset,
+        turbo_mode=args.turbo
     )
 
 
