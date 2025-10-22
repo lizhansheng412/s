@@ -83,11 +83,10 @@ def batch_process_machine(
             continue
         
         try:
-            # 处理该文件夹（使用UPSERT避免重复键错误）
+            # 处理该文件夹（主键字段根据表名自动确定）
             process_gz_folder_pipeline(
                 folder_path=str(folder_path),
                 table_name=table_name,
-                corpusid_key='corpusid',
                 use_upsert=use_upsert,
                 num_extractors=num_extractors,
                 resume=resume,

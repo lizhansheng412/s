@@ -52,9 +52,47 @@ def create_database():
         if exists:
             logger.info(f"Database {db_name} already exists")
         else:
-            logger.info(f"Creating database: {db_name}")
-            cursor.execute(f"CREATE DATABASE {db_name} WITH ENCODING 'UTF8'")
-            logger.info(f"Database {db_name} created successfully")
+            # 如果启用了表空间，先创建表空间，再创建数据库
+            tablespace_clause = ""
+            if TABLESPACE_CONFIG['enabled'] and TABLESPACE_CONFIG['location']:
+                tablespace_name = TABLESPACE_CONFIG['name']
+                location = TABLESPACE_CONFIG['location']
+                
+                logger.info(f"\n{'='*80}")
+                logger.info(f"创建表空间（用于存储整个数据库）")
+                logger.info(f"{'='*80}")
+                logger.info(f"表空间名称: {tablespace_name}")
+                logger.info(f"存储位置: {location}")
+                
+                try:
+                    # 检查表空间是否存在
+                    cursor.execute("""
+                        SELECT spcname FROM pg_tablespace WHERE spcname = %s;
+                    """, (tablespace_name,))
+                    
+                    if cursor.fetchone():
+                        logger.info(f"✓ 表空间 '{tablespace_name}' 已存在")
+                    else:
+                        # 创建表空间
+                        cursor.execute(f"""
+                            CREATE TABLESPACE {tablespace_name} 
+                            LOCATION '{location}';
+                        """)
+                        logger.info(f"✓ 表空间创建成功")
+                    
+                    tablespace_clause = f" TABLESPACE {tablespace_name}"
+                except Exception as e:
+                    logger.warning(f"⚠️  表空间创建失败: {e}")
+                    tablespace_clause = ""
+            
+            logger.info(f"\n创建数据库: {db_name}")
+            if tablespace_clause:
+                logger.info(f"数据库存储位置: {TABLESPACE_CONFIG['location']}")
+                cursor.execute(f"CREATE DATABASE {db_name} WITH ENCODING 'UTF8'{tablespace_clause}")
+            else:
+                cursor.execute(f"CREATE DATABASE {db_name} WITH ENCODING 'UTF8'")
+            
+            logger.info(f"✓ 数据库 {db_name} 创建成功")
         
         cursor.close()
         conn.close()
@@ -71,56 +109,30 @@ def create_tables(tables: list = None):
         conn.autocommit = True
         cursor = conn.cursor()
         
-        # 创建表空间（如果启用）
+        # 获取表空间配置（表会继承数据库的表空间，也可以单独指定）
         tablespace_clause = ""
         if TABLESPACE_CONFIG['enabled'] and TABLESPACE_CONFIG['location']:
             tablespace_name = TABLESPACE_CONFIG['name']
-            location = TABLESPACE_CONFIG['location']
-            
-            logger.info(f"\n{'='*80}")
-            logger.info(f"设置表空间")
-            logger.info(f"{'='*80}")
-            logger.info(f"表空间名称: {tablespace_name}")
-            logger.info(f"存储位置: {location}")
-            
-            try:
-                # 检查表空间是否存在
-                cursor.execute("""
-                    SELECT spcname FROM pg_tablespace WHERE spcname = %s;
-                """, (tablespace_name,))
-                
-                if cursor.fetchone():
-                    logger.info(f"✓ 表空间 '{tablespace_name}' 已存在")
-                else:
-                    # 创建表空间
-                    cursor.execute(f"""
-                        CREATE TABLESPACE {tablespace_name} 
-                        LOCATION '{location}';
-                    """)
-                    logger.info(f"✓ 表空间创建成功")
-                
-                tablespace_clause = f" TABLESPACE {tablespace_name}"
-            except Exception as e:
-                logger.warning(f"⚠️  表空间创建失败: {e}")
-                tablespace_clause = ""
+            tablespace_clause = f" TABLESPACE {tablespace_name}"
         
         tables_to_create = tables if tables else FIELD_TABLES
         
         logger.info(f"\n{'='*80}")
-        logger.info(f"Creating tables (UNLOGGED + TEXT type for maximum speed)")
-        logger.info(f"Target tables: {', '.join(tables_to_create)}")
-        if tablespace_clause:
-            logger.info(f"存储位置: {TABLESPACE_CONFIG['location']}")
+        logger.info(f"创建表 (UNLOGGED + TEXT类型，极速模式)")
+        logger.info(f"目标表: {', '.join(tables_to_create)}")
+        if TABLESPACE_CONFIG['enabled']:
+            logger.info(f"存储位置: {TABLESPACE_CONFIG['location']} (通过表空间)")
         logger.info(f"{'='*80}\n")
         
         for table_name in tables_to_create:
             if table_name not in FIELD_TABLES:
-                logger.warning(f"Skip invalid table: {table_name}")
+                logger.warning(f"跳过无效表: {table_name}")
                 continue
             
-            logger.info(f"Creating table: {table_name}")
+            logger.info(f"创建表: {table_name}")
             
             # 所有表统一使用TEXT类型（不验证不解析，最快）
+            # 表会继承数据库的表空间，但也可以显式指定
             cursor.execute(f"""
                 CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
                     corpusid BIGINT PRIMARY KEY,
@@ -132,10 +144,10 @@ def create_tables(tables: list = None):
             
             cursor.execute(f"ALTER TABLE {table_name} SET (autovacuum_enabled = false)")
             
-            logger.info(f"  ✓ Table {table_name} created (TEXT type)")
+            logger.info(f"  ✓ 表 {table_name} 创建成功 (TEXT类型)")
         
         logger.info(f"\n{'='*80}")
-        logger.info(f"Tables created: {len(tables_to_create)}/{len(FIELD_TABLES)}")
+        logger.info(f"已创建表: {len(tables_to_create)}/{len(FIELD_TABLES)}")
         logger.info(f"{'='*80}\n")
         
         cursor.close()

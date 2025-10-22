@@ -4,10 +4,14 @@
 极致优化版 - GZ文件流式批量插入
 性能优化：
   ✅ 生产者-消费者模式：解压和插入完全分离并行
-  ✅ 正则快速提取corpusid：避免完整JSON解析
+  ✅ 正则快速提取主键字段：避免完整JSON解析
   ✅ 更大批次：50000条/批次，减少数据库往返
   ✅ 队列缓冲：解压快时不等待，插入快时不空闲
   ✅ 断点续传：支持中断恢复
+  ✅ 灵活主键配置：不同表使用不同主键字段
+     - authors表: authorid
+     - citations表: citedcorpusid
+     - 其他表: corpusid
   
 目标：10倍性能提升（3000-5000条/秒）
 """
@@ -46,13 +50,13 @@ TABLE_CONFIGS = {
     # 10000条×16KB=160MB/批，3批=480MB提交
     
     # 小数据 (1-3KB/条): 其他表 - 大批次但控制总提交量
-    'papers': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
-    'abstracts': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
-    'authors': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
-    'citations': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
-    'paper_ids': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
-    'publication_venues': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
-    'tldrs': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 4},
+    'papers': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
+    'abstracts': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
+    'authors': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
+    'citations': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
+    'paper_ids': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
+    'publication_venues': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
+    'tldrs': {'batch_size': 100000, 'commit_batches': 3, 'extractors': 7},
     # 100000条×2KB=200MB/批，3批=600MB提交 ✓
 }
 
@@ -61,8 +65,17 @@ NUM_EXTRACTORS = 4  # USB磁盘优化：减少并发读取
 QUEUE_SIZE = 50  # USB磁盘优化：减少内存缓冲
 PROGRESS_FILE = 'logs/gz_progress.txt'
 
-# 正则表达式：快速提取corpusid（比完整JSON解析快10倍）
-CORPUSID_PATTERN = re.compile(r'"corpusid"\s*:\s*(\d+)', re.IGNORECASE)
+# 不同表使用不同的主键字段
+TABLE_PRIMARY_KEY_MAP = {
+    'authors': 'authorid',
+    'citations': 'citedcorpusid',
+    # 其他表默认使用corpusid
+}
+
+# 正则表达式：快速提取主键字段（比完整JSON解析快10倍）
+def get_key_pattern(field_name: str):
+    """根据字段名生成正则表达式"""
+    return re.compile(rf'"{field_name}"\s*:\s*(\d+)', re.IGNORECASE)
 
 # 设置日志级别为ERROR，只显示错误信息
 logging.basicConfig(
@@ -117,7 +130,7 @@ def extractor_worker(
     file_queue: Queue,
     data_queue: Queue,
     stats_dict: dict,
-    corpusid_key: str = 'corpusid',
+    table_name: str,
     batch_size: int = 10000
 ):
     """
@@ -127,6 +140,10 @@ def extractor_worker(
     # 完全禁用此进程的日志输出
     import logging
     logging.getLogger().setLevel(logging.CRITICAL)
+    
+    # 根据表名确定主键字段
+    primary_key_field = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
+    key_pattern = get_key_pattern(primary_key_field)
     
     worker_name = f"Extractor-{id(file_queue) % 1000}"
     
@@ -154,12 +171,12 @@ def extractor_worker(
                             if not line:
                                 continue
                             
-                            # 正则快速提取corpusid（避免完整JSON解析）
-                            match = CORPUSID_PATTERN.search(line)
+                            # 正则快速提取主键字段（避免完整JSON解析）
+                            match = key_pattern.search(line)
                             if not match:
                                 continue
                             
-                            corpusid = int(match.group(1))
+                            key_value = int(match.group(1))
                             valid_count += 1
                             
                             # 优化：减少字符串操作
@@ -169,7 +186,7 @@ def extractor_worker(
                             else:
                                 json_escaped = line
                             
-                            batch.append((corpusid, json_escaped))
+                            batch.append((key_value, json_escaped))
                             
                             # 批次满了，发送到队列
                             if len(batch) >= batch_size:
@@ -453,7 +470,6 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
 def process_gz_folder_pipeline(
     folder_path: str,
     table_name: str,
-    corpusid_key: str = 'corpusid',
     use_upsert: bool = False,
     num_extractors: int = NUM_EXTRACTORS,
     resume: bool = True,
@@ -482,11 +498,15 @@ def process_gz_folder_pipeline(
     
     pending_files = [(str(f), f.name) for f in gz_files if f.name not in completed_files]
     
+    # 获取该表使用的主键字段
+    primary_key_field = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
+    
     logger.info(f"\n{'='*80}")
     logger.info(f"流水线并行处理 GZ 文件（生产者-消费者模式）")
     logger.info(f"{'='*80}")
     logger.info(f"文件夹: {folder_path}")
     logger.info(f"目标表: {table_name}")
+    logger.info(f"主键字段: {primary_key_field}")
     # 根据表名获取优化配置
     config = TABLE_CONFIGS.get(table_name, DEFAULT_CONFIG)
     batch_size = config['batch_size']
@@ -538,7 +558,7 @@ def process_gz_folder_pipeline(
         for i in range(num_extractors):
             p = Process(
                 target=extractor_worker,
-                args=(file_queue, data_queue, stats_dict, corpusid_key, batch_size),
+                args=(file_queue, data_queue, stats_dict, table_name, batch_size),
                 name=f'Extractor-{i+1}'
             )
             p.start()
@@ -597,10 +617,20 @@ def main():
   🚀 更大批次：50000条/批次，减少数据库往返
   🚀 队列缓冲：持续供应数据，无空闲等待
   🚀 多进程解压：充分利用多核CPU
+  🚀 灵活主键配置：根据表名自动使用正确的主键字段
+     - authors表使用authorid
+     - citations表使用citedcorpusid
+     - 其他表使用corpusid
 
 示例：
-  # 极速处理papers文件夹
+  # 处理papers文件夹（使用corpusid作为主键）
   python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\papers" --table papers
+  
+  # 处理authors文件夹（自动使用authorid作为主键）
+  python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\authors" --table authors
+  
+  # 处理citations文件夹（自动使用citedcorpusid作为主键）
+  python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\citations" --table citations
   
   # 自定义解压进程数（根据CPU核心数）
   python scripts/stream_gz_to_db_optimized.py --dir "E:\\path\\to\\s2orc" --table s2orc --extractors 8
@@ -615,8 +645,6 @@ def main():
     parser.add_argument('--table', type=str, required=True,
                        choices=FIELD_TABLES,
                        help='目标数据库表名')
-    parser.add_argument('--key', type=str, default='corpusid',
-                       help='corpusid字段名（默认: corpusid）')
     parser.add_argument('--upsert', action='store_true',
                        help='使用UPSERT模式')
     parser.add_argument('--extractors', type=int, default=NUM_EXTRACTORS,
@@ -634,7 +662,6 @@ def main():
     process_gz_folder_pipeline(
         folder_path=args.dir,
         table_name=args.table,
-        corpusid_key=args.key,
         use_upsert=args.upsert,
         num_extractors=args.extractors,
         resume=args.resume,

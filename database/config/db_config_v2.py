@@ -26,7 +26,7 @@ DB_CONFIG = {
 TABLESPACE_CONFIG = {
     'enabled': True,
     'name': 'D1_Tablespace',
-    'location': 'F:\\PostgreSQL',
+    'location': 'E:\\postgreSQL',
 }
 
 # =============================================================================
