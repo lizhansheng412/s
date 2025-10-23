@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 批量处理脚本 - 自动处理该机器分配的所有文件夹
-支持3台机器的分布式并行处理
+支持4台机器的分布式并行处理
 """
 
 import sys
@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from machine_config import get_machine_config, FOLDER_TO_TABLE_MAP
+from machine_config import get_machine_config
 from scripts.stream_gz_to_db_optimized import process_gz_folder_pipeline, NUM_EXTRACTORS
 
 logging.basicConfig(
@@ -33,7 +33,7 @@ def batch_process_machine(
     批量处理该机器分配的所有文件夹
     
     Args:
-        machine_id: 机器ID ('machine1', 'machine2', 'machine3')
+        machine_id: 机器ID ('machine1', 'machine2', 'machine3', 'machine4')
         base_dir: S2ORC数据根目录（包含所有子文件夹）
         num_extractors: 解压进程数
         resume: 是否启用断点续传
@@ -145,25 +145,22 @@ def main():
 机器配置：
   machine1: embeddings-specter_v1, s2orc
   machine2: embeddings-specter_v2, s2orc_v2
-  machine3: abstracts, authors, citations, paper_ids, papers, publication_venues, tldrs
+  machine3: abstracts, authors, papers, publication-venues, tldrs, citations
+  machine4: paper-ids
 
 示例：
-  # 电脑1：处理分配的文件夹
-  python scripts/batch_process_machine.py --machine machine1 --base-dir "E:\\S2ORC_Data"
+  python scripts/batch_process_machine.py --machine machine1 --base-dir "E:\\2025-09-30"
+  python scripts/batch_process_machine.py --machine machine2 --base-dir "E:\\2025-09-30"
+  python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\\2025-09-30"
+  python scripts/batch_process_machine.py --machine machine4 --base-dir "E:\\2025-09-30"
   
-  # 电脑2
-  python scripts/batch_process_machine.py --machine machine2 --base-dir "F:\\S2ORC_Data"
-  
-  # 电脑3
-  python scripts/batch_process_machine.py --machine machine3 --base-dir "D:\\S2ORC_Data"
-  
-  # 自定义解压进程数（根据CPU核心数）
+  # 自定义解压进程数
   python scripts/batch_process_machine.py --machine machine1 --base-dir "E:\\data" --extractors 12
         """
     )
     
     parser.add_argument('--machine', type=str, required=True,
-                       choices=['machine1', 'machine2', 'machine3'],
+                       choices=['machine1', 'machine2', 'machine3', 'machine4'],
                        help='机器ID')
     parser.add_argument('--base-dir', type=str, required=True,
                        help='S2ORC数据根目录（包含所有子文件夹）')

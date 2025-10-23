@@ -184,7 +184,7 @@ Examples:
     )
     parser.add_argument('--init', action='store_true', help='Create database and tables')
     parser.add_argument('--tables', nargs='+', help='Table names to create')
-    parser.add_argument('--machine', type=str, choices=['machine1', 'machine2', 'machine3'],
+    parser.add_argument('--machine', type=str, choices=['machine1', 'machine2', 'machine3', 'machine4'],
                        help='Machine ID')
     
     args = parser.parse_args()

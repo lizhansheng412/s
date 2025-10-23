@@ -63,8 +63,9 @@ TABLE_CONFIGS = {
 DEFAULT_CONFIG = {'batch_size': 20000, 'commit_batches': 1, 'extractors': 1}
 NUM_EXTRACTORS = 1
 QUEUE_SIZE = 20
-PROGRESS_FILE = 'logs/gz_progress.txt'
-FAILED_FILE = 'logs/failed_files.txt'
+# 日志文件路径（将根据表名动态生成）
+PROGRESS_DIR = 'logs/progress'
+FAILED_DIR = 'logs/failed'
 
 # 不同表使用不同的主键字段
 TABLE_PRIMARY_KEY_MAP = {
@@ -77,6 +78,28 @@ TABLE_PRIMARY_KEY_MAP = {
 def get_key_pattern(field_name: str):
     """根据字段名生成正则表达式"""
     return re.compile(rf'"{field_name}"\s*:\s*(\d+)', re.IGNORECASE)
+
+def get_log_files(table_name: str):
+    """
+    根据表名获取专属的日志文件路径
+    
+    Args:
+        table_name: 表名
+    
+    Returns:
+        (progress_file, failed_file) 元组
+    """
+    progress_dir = Path(PROGRESS_DIR)
+    failed_dir = Path(FAILED_DIR)
+    
+    # 创建目录
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    
+    progress_file = progress_dir / f"{table_name}_progress.txt"
+    failed_file = failed_dir / f"{table_name}_failed.txt"
+    
+    return str(progress_file), str(failed_file)
 
 # 设置日志级别为ERROR，只显示错误信息
 logging.basicConfig(
@@ -653,9 +676,12 @@ def process_gz_folder_pipeline(
     if not folder.exists():
         raise ValueError(f"文件夹不存在: {folder_path}")
     
-    # 初始化进度跟踪
-    tracker = ProgressTracker(PROGRESS_FILE)
-    failed_logger = FailedFilesLogger(FAILED_FILE)
+    # 根据表名获取专属的日志文件路径
+    progress_file, failed_file = get_log_files(table_name)
+    
+    # 初始化进度跟踪（每个表独立的日志文件）
+    tracker = ProgressTracker(progress_file)
+    failed_logger = FailedFilesLogger(failed_file)
     
     if reset_progress:
         tracker.reset()
