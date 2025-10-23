@@ -6,7 +6,6 @@
 
 - ⚡ **超高速度**: 2000-4500条/秒（优化后提升2.5-4倍）
 - 🔄 **断点续传**: 中断后自动恢复
-- 💾 **TURBO模式**: 可选极速插入（临时禁用WAL）
 - 🔐 **100% E盘存储**: 所有数据存储在 `E:\postgreSQL`
 - 🎯 **智能主键**: 不同表自动使用正确的主键字段
 - 🛡️ **内存安全**: 仅使用15-17GB（32GB系统安全）
@@ -30,8 +29,6 @@ python scripts/init_database.py --init --machine machine3
 # 4. 开始导入（推荐）
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 
-# 4. 开始导入（TURBO模式，极速但有风险）
-python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30" --turbo
 ```
 
 ### 🔄 中断后继续
@@ -53,49 +50,6 @@ python scripts/init_database.py --init --machine machine3
 # 3. 重新导入
 python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30"
 ```
-
----
-
-## 📊 性能优化
-
-### 优化效果对比
-
-| 配置 | 速度 | 完成时间 | 单次commit | 内存使用 |
-|------|------|---------|-----------|---------|
-| **原始配置** | 827条/秒 | 26小时+ | 480MB | ~6GB |
-| **优化配置** | 2000-3000条/秒 | 8-12小时 | 1.6GB | ~8-11GB |
-| **TURBO模式** | 3000-4500条/秒 | 6-9小时 | 1.6GB | ~8-11GB |
-
-**提升效果**: 速度提升 **2.5-4倍**，时间节省 **60-70%**
-
-### 各表优化配置（自动应用，彻底避免缓冲区问题）
-
-| 表名 | batch_size | commit_batches | extractors | 每次commit | 重复处理 |
-|------|-----------|---------------|-----------|-----------|---------|
-| embeddings_specter_v1/v2 | 15,000 | 3 | 6 | 720MB | VALUES |
-| s2orc/s2orc_v2 | 2,000 | 3 | 6 | 600MB | VALUES |
-| citations | 8,000 | 2 | 6 | 160MB | VALUES |
-| papers/abstracts/等 | 25,000 | 3 | 7 | 375MB | VALUES |
-
-**关键优化**：
-- ✅ 所有表都使用 **VALUES 方式**处理重复键，不使用临时表
-- ✅ 减小 batch_size 和 commit_batches，频繁释放内存
-- ✅ 彻底避免"没有可用的本地缓冲区"错误
-
-### TURBO模式说明
-
-**启用方式**：添加 `--turbo` 参数
-
-```powershell
-python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-09-30" --turbo
-```
-
-**说明**：
-- ✅ 速度提升30-50%（3000-4500条/秒）
-- ⚠️ 临时禁用WAL日志（表设为UNLOGGED）
-- ⚠️ 数据库崩溃可能丢失正在导入的数据
-- ✅ 完成后自动恢复为LOGGED模式
-- 💡 建议：仅在初次批量导入时使用
 
 ---
 
@@ -172,9 +126,6 @@ psql -U postgres -c "SELECT spcname, pg_size_pretty(pg_tablespace_size(spcname))
 ```powershell
 # 处理特定文件夹
 python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers
-
-# 使用TURBO模式
-python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers --turbo
 
 # 自定义进程数
 python scripts/stream_gz_to_db_optimized.py --dir "E:\2025-09-30\papers" --table papers --extractors 12
@@ -271,19 +222,3 @@ gz_filed_update/
 └── logs/
     └── gz_progress.txt               # 进度记录
 ```
-
----
-
-## 🔒 系统要求
-
-- **Python**: 3.8+
-- **PostgreSQL**: 12+
-- **内存**: 16GB+ 推荐（优化配置下使用15-17GB）
-- **CPU**: 多核推荐（用于并行解压）
-- **磁盘**: E盘需有足够空间（建议500GB+）
-
----
-
-## 📝 许可证
-
-MIT License

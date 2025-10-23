@@ -39,34 +39,32 @@ from database.config.db_config_v2 import DB_CONFIG, FIELD_TABLES
 
 # 针对TEXT类型优化配置（彻底避免缓冲区问题：不使用临时表，使用VALUES）
 TABLE_CONFIGS = {
-    # 超大数据 (60-120KB/条): s2orc系列 - 控制内存使用，频繁commit
-    's2orc': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 6},
-    's2orc_v2': {'batch_size': 2000, 'commit_batches': 3, 'extractors': 6},
-    # 2000条×100KB=200MB/批，3批=600MB提交（安全+频繁释放）
+    # 超大数据 (60-120KB/条): s2orc系列 
+    's2orc': {'batch_size': 1000, 'commit_batches': 3, 'extractors': 1},
+    's2orc_v2': {'batch_size': 1000, 'commit_batches': 3, 'extractors': 1},
+    # 1000条×100KB×3批=300MB/批次
         
-    # 中等数据 (16KB/条): embeddings系列 - 减小批次，频繁commit
-    'embeddings_specter_v1': {'batch_size': 15000, 'commit_batches': 3, 'extractors': 6},
-    'embeddings_specter_v2': {'batch_size': 15000, 'commit_batches': 3, 'extractors': 6},
-    # 15000条×16KB=240MB/批，3批=720MB提交（安全范围）
+    # 中等数据 (16KB/条): embeddings系列 
+    'embeddings_specter_v1': {'batch_size': 6250, 'commit_batches': 3, 'extractors': 1},
+    'embeddings_specter_v2': {'batch_size': 6250, 'commit_batches': 3, 'extractors': 1},
+    # 6250条×16KB×3批=300MB/批次
     
-    # 小数据 (1-3KB/条): 其他表 - 小批次+频繁commit
-    'papers': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
-    'abstracts': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
-    'authors': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
-    'citations': {'batch_size': 8000, 'commit_batches': 2, 'extractors': 6},  # citations最容易重复
-    'paper_ids': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
-    'publication_venues': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
-    'tldrs': {'batch_size': 25000, 'commit_batches': 3, 'extractors': 7},
-    # 所有表统一策略：小批次+频繁commit，彻底避免缓冲区问题
+    # 小数据 (1-3KB/条): 其他表
+    'papers': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
+    'abstracts': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
+    'authors': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
+    'citations': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 1},
+    'paper_ids': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
+    'publication_venues': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
+    'tldrs': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
+    # 50,000条×2KB×3批=300MB/批次
 }
 
-DEFAULT_CONFIG = {'batch_size': 100000, 'commit_batches': 5, 'extractors': 6}
-NUM_EXTRACTORS = 6  # 默认解压进程数（已优化）
-QUEUE_SIZE = 80  # 队列大小：增大缓冲（已优化）
+DEFAULT_CONFIG = {'batch_size': 20000, 'commit_batches': 1, 'extractors': 1}
+NUM_EXTRACTORS = 1
+QUEUE_SIZE = 20
 PROGRESS_FILE = 'logs/gz_progress.txt'
-
-# 性能提升模式（警告：TURBO模式会禁用WAL日志，数据库崩溃时可能丢失数据）
-TURBO_MODE = False  # 设置为True启用极速模式（仅建议初次批量导入时使用）
+FAILED_FILE = 'logs/failed_files.txt'
 
 # 不同表使用不同的主键字段
 TABLE_PRIMARY_KEY_MAP = {
@@ -111,8 +109,6 @@ class ProgressTracker:
                 if line:
                     completed.add(line)
         
-        if completed:
-            logger.info(f"✓ 已加载进度: {len(completed)} 个文件已完成")
         return completed
     
     def mark_completed(self, file_name: str):
@@ -123,6 +119,43 @@ class ProgressTracker:
     def reset(self):
         if self.progress_file.exists():
             self.progress_file.unlink()
+
+
+class FailedFilesLogger:
+    """失败文件记录器"""
+    
+    def __init__(self, failed_file: str):
+        self.failed_file = Path(failed_file)
+        self.failed_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    def load_failed(self) -> Set[str]:
+        """加载已知失败的文件列表"""
+        if not self.failed_file.exists():
+            return set()
+        
+        failed = set()
+        with open(self.failed_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # 提取文件名（格式：时间戳 | 文件名 | 错误信息）
+                    parts = line.split('|')
+                    if len(parts) >= 2:
+                        failed.add(parts[1].strip())
+        
+        return failed
+    
+    def log_failed(self, file_name: str, error: str):
+        """记录失败文件"""
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(self.failed_file, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} | {file_name} | {error}\n")
+            f.flush()
+    
+    def reset(self):
+        if self.failed_file.exists():
+            self.failed_file.unlink()
 
 
 # =============================================================================
@@ -166,8 +199,14 @@ def extractor_worker(
                 valid_count = 0
                 
                 # 流式解压 - 遇到损坏直接跳过，不重试
+                # USB盘优化：使用二进制模式+更大缓冲区，减少随机I/O
                 try:
-                    with gzip.open(gz_file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                    import io
+                    # 使用二进制模式打开，设置8MB缓冲区
+                    with gzip.open(gz_file_path, 'rb') as f_binary:
+                        # 包装为带大缓冲区的文本流
+                        f = io.TextIOWrapper(io.BufferedReader(f_binary, buffer_size=8*1024*1024), 
+                                            encoding='utf-8', errors='ignore')
                         for line in f:
                             line_count += 1
                             line = line.strip()
@@ -224,10 +263,10 @@ def inserter_worker(
     table_name: str,
     stats_dict: dict,
     tracker: ProgressTracker,
+    failed_logger: FailedFilesLogger,
     use_upsert: bool = False,
     commit_batches: int = 3,
     total_files: int = 0,
-    turbo_mode: bool = False,
     primary_key: str = 'corpusid'
 ):
     """
@@ -237,43 +276,40 @@ def inserter_worker(
     Args:
         primary_key: 主键字段名（默认corpusid）
     """
-    print("\n🚀 数据插入进程已启动\n")
-    
     try:
         # 创建数据库连接
         conn = psycopg2.connect(**DB_CONFIG)
         conn.autocommit = False
         cursor = conn.cursor()
         
-        # 性能优化配置（平衡：性能 vs 内存安全）
+        # 性能优化配置（分离读写路径后的优化配置，充分利用8核32GB）
         try:
             cursor.execute("SET synchronous_commit = OFF")  # 异步提交（关键优化）
-            cursor.execute("SET commit_delay = 100000")  # 延迟提交100ms（PostgreSQL最大值）
-            cursor.execute("SET maintenance_work_mem = '4GB'")  # 维护内存（安全值）
-            cursor.execute("SET work_mem = '1GB'")  # 工作内存（减小，避免缓冲区耗尽）
-            cursor.execute("SET temp_buffers = '8GB'")  # 临时缓冲区（翻倍，关键！）
-            cursor.execute("SET effective_cache_size = '24GB'")  # 缓存大小（假设系统32GB内存）
-            cursor.execute("SET max_parallel_workers_per_gather = 0")  # 关闭并行（批量插入不需要）
+            cursor.execute("SET commit_delay = 100000")  # 延迟提交100ms
+            cursor.execute("SET maintenance_work_mem = '2GB'")  # 维护内存（适中，避免脏页积压）
+            cursor.execute("SET work_mem = '512MB'")  # 工作内存（适中）
+            cursor.execute("SET temp_buffers = '4GB'")  # 临时缓冲区
+            cursor.execute("SET effective_cache_size = '16GB'")  # 缓存大小
+            cursor.execute("SET max_parallel_workers_per_gather = 0")  # 关闭并行
+            # 临时表空间使用D盘（前提：已创建d1_temp表空间）
+            try:
+                cursor.execute("SET temp_tablespaces = 'd1_temp'")
+            except:
+                pass  # 如果表空间不存在，忽略
         except Exception as e:
-            conn.rollback()  # 回滚失败的设置
+            conn.rollback()
             logger.warning(f"部分性能配置失败（可忽略）: {e}")
+        
+        # 这些参数需要在postgresql.conf中设置，不能在会话级别修改，注释掉避免警告
+        # bgwriter_delay = 1000ms  # 后台写入延迟（减少随机写）
+        # checkpoint_timeout = 30min  # 检查点间隔（减少刷盘）
+        # checkpoint_completion_target = 0.9  # 检查点完成目标
         
         # WAL设置（可能失败，单独处理）
         try:
             cursor.execute("SET wal_writer_delay = '1000ms'")
         except Exception:
             conn.rollback()  # 回滚并继续
-        
-        # TURBO模式：临时禁用WAL（极速但有风险）
-        if turbo_mode and not use_upsert:
-            print("⚠️  TURBO模式已启用 - 表将临时设为UNLOGGED（数据库崩溃可能丢失数据）")
-            try:
-                cursor.execute(f"ALTER TABLE {table_name} SET UNLOGGED")
-                conn.commit()
-            except Exception as e:
-                conn.rollback()  # 关键：回滚失败的事务
-                print(f"⚠️  无法启用UNLOGGED模式: {e}")
-                print("⚠️  继续使用LOGGED模式（性能会稍慢）")
         
         # 禁用触发器（INSERT模式）
         if not use_upsert:
@@ -299,7 +335,6 @@ def inserter_worker(
                 item_type = item[0]
                 
                 if item_type == 'stop':
-                    logger.info("[Inserter] 收到停止信号")
                     break
                 
                 elif item_type == 'data':
@@ -326,19 +361,25 @@ def inserter_worker(
                         # 跳过这个批次，继续处理下一个
                         continue
                     
-                    # 定期输出进度（每10秒）
+                    # 定期输出进度（每3秒）
                     current_time = time.time()
                     if current_time - last_log_time >= 3:
                         elapsed = current_time - start_time
                         rate = total_inserted / elapsed if elapsed > 0 else 0
-                        
-                        # 计算进度和预估时间
                         progress_pct = (completed_files / total_files * 100) if total_files > 0 else 0
-                        remaining_files = total_files - completed_files
-                        eta_seconds = (remaining_files * elapsed / completed_files) if completed_files > 0 else 0
-                        eta_hours = int(eta_seconds / 3600)
-                        eta_mins = int((eta_seconds % 3600) / 60)
-                        eta_str = f"{eta_hours}h{eta_mins}m" if eta_hours > 0 else f"{eta_mins}分"
+                        
+                        # 估算剩余时间：必须完成至少1个文件才能准确估算
+                        if completed_files > 0:
+                            # 基于已完成文件的平均时间估算剩余时间
+                            avg_time_per_file = elapsed / completed_files
+                            remaining_files = total_files - completed_files
+                            eta_seconds = remaining_files * avg_time_per_file
+                            eta_hours = int(eta_seconds / 3600)
+                            eta_mins = int((eta_seconds % 3600) / 60)
+                            eta_str = f"{eta_hours}小时{eta_mins}分" if eta_hours > 0 else f"{eta_mins}分"
+                        else:
+                            # 没有完成文件时，显示"计算中..."而不是"0分"
+                            eta_str = "计算中..."
                         
                         print(f"\r📊 [{completed_files}/{total_files}] {progress_pct:.1f}% | "
                               f"{total_inserted:,}条 | {rate:.0f}条/秒 | "
@@ -354,9 +395,9 @@ def inserter_worker(
                 
                 elif item_type == 'error':
                     _, file_name, error = item
-                    # 标记损坏文件为已完成，避免重复处理
-                    tracker.mark_completed(file_name)
-                    completed_files += 1
+                    # 记录失败文件（不标记为已完成）
+                    failed_logger.log_failed(file_name, error)
+                    completed_files += 1  # 计数但不标记为成功
             
             except Empty:
                 # 队列空，继续等待
@@ -372,24 +413,9 @@ def inserter_worker(
         
         # 恢复表状态
         if not use_upsert:
-            # 恢复LOGGED状态（如果之前设为UNLOGGED）
-            if turbo_mode:
-                print("\n🔄 恢复表为LOGGED状态...")
-                try:
-                    cursor.execute(f"ALTER TABLE {table_name} SET LOGGED")
-                    conn.commit()
-                    print("✅ 表已恢复LOGGED状态")
-                except Exception as e:
-                    print(f"⚠️  恢复LOGGED失败: {e}")
-            
             # 启用触发器
             cursor.execute(f"ALTER TABLE {table_name} ENABLE TRIGGER ALL")
             conn.commit()
-        
-        elapsed = time.time() - start_time
-        rate = total_inserted / elapsed if elapsed > 0 else 0
-        
-        print(f"\n\n✅ 插入完成: {total_inserted:,}条 | 平均速度: {rate:.0f}条/秒 | 用时: {elapsed/60:.1f}分钟\n")
         
         cursor.close()
         conn.close()
@@ -464,53 +490,137 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
             return total_processed
         else:
             # INSERT模式：极速COPY（TEXT类型，不验证不解析，最快）
-            buffer = StringIO()
-            lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch]
-            buffer.write(''.join(lines))
-            buffer.seek(0)
             
-            try:
-                cursor.copy_expert(
-                    f"""
-                    COPY {table_name} ({primary_key}, data, insert_time, update_time)
-                    FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
-                    """,
-                    buffer
-                )
-                return len(batch)
-            except psycopg2.errors.UniqueViolation:
-                # 有重复key，使用VALUES逐条插入（避免临时表耗尽缓冲区）
-                cursor.connection.rollback()
+            # 特殊处理：citations表预去重（同一篇论文被多次引用导致高重复率）
+            if table_name == 'citations':
+                # 1. 批内去重（对citations表至关重要！减少58%的无效插入）
+                seen = {}
+                original_count = len(batch)
+                for key_value, data in batch:
+                    seen[key_value] = data  # 相同key保留最后一个
                 
-                # 批量VALUES插入，ON CONFLICT DO NOTHING（不使用临时表）
-                inserted_count = 0
-                # 分小批次插入，每次最多1000条
-                chunk_size = 1000
-                for i in range(0, len(batch), chunk_size):
-                    chunk = batch[i:i + chunk_size]
+                dedup_count = len(seen)
+                if dedup_count == 0:
+                    return 0  # 批次为空，跳过
+                
+                # 2. 去重后直接COPY插入（无需ON CONFLICT检查，最快）
+                buffer = StringIO()
+                lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in seen.items()]
+                buffer.write(''.join(lines))
+                buffer.seek(0)
+                
+                try:
+                    cursor.copy_expert(
+                        f"""
+                        COPY {table_name} ({primary_key}, data, insert_time, update_time)
+                        FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
+                        """,
+                        buffer
+                    )
+                    return dedup_count
+                except psycopg2.errors.UniqueViolation:
+                    # 跨批次重复，使用预查询过滤法（静默处理，避免刷屏）
+                    cursor.connection.rollback()
                     
-                    # 构建VALUES子句
-                    values_list = []
-                    for key_val, data in chunk:
-                        # 转义单引号
-                        escaped_data = data.replace("'", "''")
-                        values_list.append(f"({key_val}, '{escaped_data}', NOW(), NOW())")
+                    # 1. 批量查询已存在的ID（一次索引查询，比N次ON CONFLICT快得多）
+                    seen_ids = list(seen.keys())
+                    if not seen_ids:
+                        return 0  # 无数据可查
+                        
+                    placeholders = ','.join(['%s'] * len(seen_ids))
+                    cursor.execute(f"""
+                        SELECT {primary_key} FROM {table_name} 
+                        WHERE {primary_key} IN ({placeholders})
+                    """, seen_ids)
                     
-                    values_clause = ','.join(values_list)
+                    existing_ids = set(row[0] for row in cursor.fetchall())
+                    
+                    # 2. 过滤掉已存在的ID
+                    new_items = {k: v for k, v in seen.items() if k not in existing_ids}
+                    
+                    if not new_items:
+                        return 0  # 全部已存在
+                    
+                    # 3. 直接COPY插入新数据（无需ON CONFLICT，最快）
+                    buffer = StringIO()
+                    lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in new_items.items()]
+                    buffer.write(''.join(lines))
+                    buffer.seek(0)
                     
                     try:
-                        cursor.execute(f"""
-                            INSERT INTO {table_name} ({primary_key}, data, insert_time, update_time)
-                            VALUES {values_clause}
-                            ON CONFLICT ({primary_key}) DO NOTHING
-                        """)
-                        inserted_count += len(chunk)
+                        cursor.copy_expert(
+                            f"""
+                            COPY {table_name} ({primary_key}, data, insert_time, update_time)
+                            FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
+                            """,
+                            buffer
+                        )
+                        return len(new_items)
                     except Exception as e:
-                        # 如果VALUES也失败，跳过这个chunk
-                        logger.warning(f"VALUES插入失败，跳过{len(chunk)}条: {e}")
-                        continue
+                        # 如果还是失败（理论上不应该），静默跳过
+                        cursor.connection.rollback()
+                        return 0
+            
+            else:
+                # 其他表：主键唯一，直接COPY（最快）
+                buffer = StringIO()
+                lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch]
+                buffer.write(''.join(lines))
+                buffer.seek(0)
                 
-                return inserted_count
+                try:
+                    cursor.copy_expert(
+                        f"""
+                        COPY {table_name} ({primary_key}, data, insert_time, update_time)
+                        FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
+                        """,
+                        buffer
+                    )
+                    return len(batch)
+                except psycopg2.errors.UniqueViolation:
+                    # 有重复key（静默处理，使用预查询过滤法）
+                    cursor.connection.rollback()
+                    
+                    # 1. 提取所有ID
+                    batch_ids = [key_val for key_val, _ in batch]
+                    if not batch_ids:
+                        return 0  # 无数据可查
+                        
+                    placeholders = ','.join(['%s'] * len(batch_ids))
+                    
+                    # 2. 批量查询已存在的ID
+                    cursor.execute(f"""
+                        SELECT {primary_key} FROM {table_name} 
+                        WHERE {primary_key} IN ({placeholders})
+                    """, batch_ids)
+                    
+                    existing_ids = set(row[0] for row in cursor.fetchall())
+                    
+                    # 3. 过滤掉已存在的ID
+                    new_batch = [(k, v) for k, v in batch if k not in existing_ids]
+                    
+                    if not new_batch:
+                        return 0  # 全部已存在
+                    
+                    # 4. 直接COPY插入新数据
+                    buffer = StringIO()
+                    lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in new_batch]
+                    buffer.write(''.join(lines))
+                    buffer.seek(0)
+                    
+                    try:
+                        cursor.copy_expert(
+                            f"""
+                            COPY {table_name} ({primary_key}, data, insert_time, update_time)
+                            FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
+                            """,
+                            buffer
+                        )
+                        return len(new_batch)
+                    except Exception as e:
+                        # 静默跳过
+                        cursor.connection.rollback()
+                        return 0
         
     except psycopg2.errors.UniqueViolation:
         # 如果还是失败，说明事务已中止，需要外层处理
@@ -534,7 +644,7 @@ def process_gz_folder_pipeline(
     num_extractors: int = NUM_EXTRACTORS,
     resume: bool = True,
     reset_progress: bool = False,
-    turbo_mode: bool = False
+    retry_failed: bool = False
 ):
     """
     流水线并行处理：多个解压进程 + 单个插入进程
@@ -545,11 +655,15 @@ def process_gz_folder_pipeline(
     
     # 初始化进度跟踪
     tracker = ProgressTracker(PROGRESS_FILE)
+    failed_logger = FailedFilesLogger(FAILED_FILE)
     
     if reset_progress:
         tracker.reset()
+        failed_logger.reset()
     
+    # 加载已完成和失败的文件
     completed_files = tracker.load_completed() if resume else set()
+    failed_files = failed_logger.load_failed() if (resume and not retry_failed) else set()
     
     # 扫描GZ文件
     gz_files = sorted(folder.glob("*.gz"))
@@ -557,17 +671,13 @@ def process_gz_folder_pipeline(
         logger.warning(f"未找到.gz文件: {folder_path}")
         return
     
-    pending_files = [(str(f), f.name) for f in gz_files if f.name not in completed_files]
+    # 过滤：排除已完成的文件，以及已知失败的文件（除非retry_failed=True）
+    excluded_files = completed_files | failed_files
+    pending_files = [(str(f), f.name) for f in gz_files if f.name not in excluded_files]
     
     # 获取该表使用的主键字段
     primary_key_field = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
     
-    logger.info(f"\n{'='*80}")
-    logger.info(f"流水线并行处理 GZ 文件（生产者-消费者模式）")
-    logger.info(f"{'='*80}")
-    logger.info(f"文件夹: {folder_path}")
-    logger.info(f"目标表: {table_name}")
-    logger.info(f"主键字段: {primary_key_field}")
     # 根据表名获取优化配置
     config = TABLE_CONFIGS.get(table_name, DEFAULT_CONFIG)
     batch_size = config['batch_size']
@@ -576,17 +686,12 @@ def process_gz_folder_pipeline(
     if num_extractors == NUM_EXTRACTORS:  # 默认值
         num_extractors = config['extractors']
     
-    logger.info(f"总文件数: {len(gz_files)}")
-    logger.info(f"已完成: {len(completed_files)}")
-    logger.info(f"待处理: {len(pending_files)}")
-    logger.info(f"优化配置: 批次={batch_size:,}, commit间隔={commit_batches}, 进程={num_extractors}")
-    logger.info(f"模式: {'UPSERT' if use_upsert else 'INSERT (COPY)'}")
-    if turbo_mode:
-        logger.warning(f"⚠️  TURBO模式: 已启用（表将临时设为UNLOGGED，提升性能但有风险）")
-    logger.info(f"{'='*80}\n")
+    # 精简输出：一行显示核心信息
+    failed_info = f", 失败: {len(failed_files)}" if failed_files else ""
+    logger.info(f"\n▶ [{table_name}] 总计: {len(gz_files)}, 已完成: {len(completed_files)}{failed_info}, 待处理: {len(pending_files)}")
     
     if not pending_files:
-        logger.info("✅ 所有文件已处理完成！")
+        logger.info("✅ 所有文件已处理完成！\n")
         return
     
     overall_start = time.time()
@@ -611,7 +716,7 @@ def process_gz_folder_pipeline(
         # 启动插入进程（消费者）
         inserter = Process(
             target=inserter_worker,
-            args=(data_queue, table_name, stats_dict, tracker, use_upsert, commit_batches, len(pending_files), turbo_mode, primary_key_field),
+            args=(data_queue, table_name, stats_dict, tracker, failed_logger, use_upsert, commit_batches, len(pending_files), primary_key_field),
             name='Inserter'
         )
         inserter.start()
@@ -627,13 +732,9 @@ def process_gz_folder_pipeline(
             p.start()
             extractors.append(p)
         
-        print(f"✓ 已启动 {num_extractors} 个解压进程 + 1 个插入进程")
-        
         # 等待所有解压进程完成
         for p in extractors:
             p.join()
-        
-        logger.info("✓ 所有解压进程已完成")
         
         # 发送停止信号给插入进程
         data_queue.put(('stop', None, None))
@@ -645,13 +746,7 @@ def process_gz_folder_pipeline(
         total_inserted = stats_dict.get('inserted', 0)
         avg_rate = total_inserted / elapsed if elapsed > 0 else 0
         
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✅ 全部完成！")
-        logger.info(f"  文件数: {len(pending_files)}")
-        logger.info(f"  总插入: {total_inserted:,} 条")
-        logger.info(f"  总耗时: {elapsed:.2f}秒 ({elapsed/60:.1f}分钟)")
-        logger.info(f"  平均速度: {avg_rate:.0f} 条/秒")
-        logger.info(f"{'='*80}\n")
+        logger.info(f"✅ [{table_name}] 完成: {len(pending_files)}个文件, {total_inserted:,}条, {elapsed/60:.1f}分钟, {avg_rate:.0f}条/秒\n")
         
     except KeyboardInterrupt:
         logger.warning("\n⚠️  用户中断（进度已保存）")
@@ -716,8 +811,8 @@ def main():
                        help='启用断点续传')
     parser.add_argument('--reset', action='store_true',
                        help='重置进度')
-    parser.add_argument('--turbo', action='store_true',
-                       help='启用TURBO模式（临时将表设为UNLOGGED，极速但有风险）')
+    parser.add_argument('--retry-failed', action='store_true',
+                       help='重新处理失败的文件（重新下载后使用）')
     
     parser.set_defaults(resume=True)
     
@@ -731,7 +826,7 @@ def main():
         num_extractors=args.extractors,
         resume=args.resume,
         reset_progress=args.reset,
-        turbo_mode=args.turbo
+        retry_failed=args.retry_failed
     )
 
 

@@ -12,11 +12,11 @@ from pathlib import Path
 # =============================================================================
 
 DB_CONFIG = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'port': int(os.getenv('DB_PORT', 5432)),
-    'database': os.getenv('DB_NAME', 's2orc_d1'),
-    'user': os.getenv('DB_USER', 'postgres'),
-    'password': os.getenv('DB_PASSWORD', 'grained'),
+    'host': 'localhost',
+    'port': 5433,  # 根据机器配置修改
+    'database': 's2orc_d3',  # 根据机器配置修改
+    'user': 'postgres',
+    'password': 'grained',
 }
 
 # =============================================================================
@@ -24,9 +24,9 @@ DB_CONFIG = {
 # =============================================================================
 
 TABLESPACE_CONFIG = {
-    'enabled': True,
-    'name': 'd1_tablespace',  # 小写，匹配PostgreSQL实际存储
-    'location': 'E:\\postgreSQL',
+    'enabled': False,  # 禁用自定义表空间，使用默认位置
+    'name': 'd3_tablespace',  # 根据机器配置修改
+    'location': 'E:\\postgreSQL',  # 禁用时此项被忽略
 }
 
 # =============================================================================
