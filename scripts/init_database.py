@@ -124,10 +124,11 @@ def create_tables(tables: list = None):
             logger.info(f"存储位置: {TABLESPACE_CONFIG['location']} (通过表空间)")
         logger.info(f"{'='*80}\n")
         
-        # 不同表使用不同的主键列名
+        # 不同表使用不同的主键列名和类型
         TABLE_PRIMARY_KEY_MAP = {
-            'authors': 'authorid',
-            'citations': 'citedcorpusid',
+            'authors': ('authorid', 'BIGINT'),
+            'citations': ('corpusid', 'BIGINT'),  # 数据库字段名是corpusid（值从citingcorpusid提取）
+            'publication_venues': ('publicationvenueid', 'TEXT'),  # UUID字符串
         }
         
         for table_name in tables_to_create:
@@ -135,16 +136,16 @@ def create_tables(tables: list = None):
                 logger.warning(f"跳过无效表: {table_name}")
                 continue
             
-            # 确定主键列名
-            primary_key = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
+            # 确定主键列名和类型
+            primary_key, key_type = TABLE_PRIMARY_KEY_MAP.get(table_name, ('corpusid', 'BIGINT'))
             
-            logger.info(f"创建表: {table_name} (主键: {primary_key})")
+            logger.info(f"创建表: {table_name} (主键: {primary_key} {key_type})")
             
-            # 不同表使用不同的主键列名（TEXT类型，不验证不解析，最快）
+            # 不同表使用不同的主键列名和类型（data为TEXT类型，不验证不解析，最快）
             # 表会继承数据库的表空间，但也可以显式指定
             cursor.execute(f"""
                 CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
-                    {primary_key} BIGINT PRIMARY KEY,
+                    {primary_key} {key_type} PRIMARY KEY,
                     data TEXT,
                     insert_time TIMESTAMP DEFAULT NOW(),
                     update_time TIMESTAMP DEFAULT NOW()
@@ -153,7 +154,7 @@ def create_tables(tables: list = None):
             
             cursor.execute(f"ALTER TABLE {table_name} SET (autovacuum_enabled = false)")
             
-            logger.info(f"  ✓ 表 {table_name} 创建成功 (主键: {primary_key}, TEXT类型)")
+            logger.info(f"  ✓ 表 {table_name} 创建成功 (主键: {primary_key} {key_type}, 数据: TEXT类型)")
         
         logger.info(f"\n{'='*80}")
         logger.info(f"已创建表: {len(tables_to_create)}/{len(FIELD_TABLES)}")

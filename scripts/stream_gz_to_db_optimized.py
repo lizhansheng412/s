@@ -10,7 +10,8 @@
   ✅ 断点续传：支持中断恢复
   ✅ 灵活主键配置：不同表使用不同主键字段
      - authors表: authorid
-     - citations表: citedcorpusid
+     - citations表: corpusid（值从citingcorpusid提取，数据聚合为JSON数组）
+     - publication_venues表: publicationvenueid（值从id提取，UUID字符串）
      - 其他表: corpusid
   
 目标：10倍性能提升（3000-5000条/秒）
@@ -67,17 +68,36 @@ QUEUE_SIZE = 20
 PROGRESS_DIR = 'logs/progress'
 FAILED_DIR = 'logs/failed'
 
-# 不同表使用不同的主键字段
+# 不同表使用不同的主键字段（数据库字段名）
 TABLE_PRIMARY_KEY_MAP = {
     'authors': 'authorid',
-    'citations': 'citedcorpusid',
+    'citations': 'corpusid',  # 数据库字段名是corpusid（保持一致性）
+    'publication_venues': 'publicationvenueid',
     # 其他表默认使用corpusid
 }
 
+# JSON字段名到数据库字段名的映射（用于正则提取）
+JSON_FIELD_MAP = {
+    'citations': 'citingcorpusid',  # JSON中的citingcorpusid字段对应数据库的corpusid
+    'publication_venues': 'id',  # JSON中的id字段对应数据库的publicationvenueid
+    # 其他表的JSON字段名和数据库字段名一致，使用数据库字段名即可
+}
+
 # 正则表达式：快速提取主键字段（比完整JSON解析快10倍）
-def get_key_pattern(field_name: str):
-    """根据字段名生成正则表达式"""
-    return re.compile(rf'"{field_name}"\s*:\s*(\d+)', re.IGNORECASE)
+def get_key_pattern(field_name: str, is_uuid: bool = False):
+    """
+    根据字段名生成正则表达式
+    
+    Args:
+        field_name: JSON字段名
+        is_uuid: 是否是UUID类型（字符串），否则是数字类型
+    """
+    if is_uuid:
+        # UUID格式: "id": "0b0cbb6c-54d7-4989-9265-abb19476957d"
+        return re.compile(rf'"{field_name}"\s*:\s*"([0-9a-f\-]+)"', re.IGNORECASE)
+    else:
+        # 数字格式: "corpusid": 12345
+        return re.compile(rf'"{field_name}"\s*:\s*(\d+)', re.IGNORECASE)
 
 def get_log_files(table_name: str):
     """
@@ -200,9 +220,13 @@ def extractor_worker(
     import logging
     logging.getLogger().setLevel(logging.CRITICAL)
     
-    # 根据表名确定主键字段
+    # 根据表名确定主键字段（数据库字段名）
     primary_key_field = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
-    key_pattern = get_key_pattern(primary_key_field)
+    # 确定JSON中对应的字段名（用于正则提取）
+    json_field_name = JSON_FIELD_MAP.get(table_name, primary_key_field)
+    # publication_venues表的主键是UUID字符串，其他表是数字
+    is_uuid = (table_name == 'publication_venues')
+    key_pattern = get_key_pattern(json_field_name, is_uuid=is_uuid)
     
     worker_name = f"Extractor-{id(file_queue) % 1000}"
     
@@ -241,7 +265,8 @@ def extractor_worker(
                             if not match:
                                 continue
                             
-                            key_value = int(match.group(1))
+                            # 提取主键值（UUID字符串或数字）
+                            key_value = match.group(1) if is_uuid else int(match.group(1))
                             valid_count += 1
                             
                             # 优化：直接使用原始行，避免不必要的转义检查
@@ -458,22 +483,26 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
     数据以TEXT格式存储（不验证不解析，极速）
     
     注意：
-    - authors表：主键列名是authorid
-    - citations表：主键列名是citedcorpusid
-    - 其他表：主键列名是corpusid
+    - authors表：主键列名是authorid (BIGINT)
+    - citations表：主键列名是corpusid (BIGINT)，值从citingcorpusid提取，data聚合为JSON数组
+    - publication_venues表：主键列名是publicationvenueid (TEXT)，值从id提取（UUID字符串）
+    - 其他表：主键列名是corpusid (BIGINT)
     
     Args:
         cursor: 数据库游标
         table_name: 表名
         batch: 数据批次 [(key_value, json_line), ...] - key_value已从JSON正确字段提取
         use_upsert: 是否使用UPSERT模式
-        primary_key: 主键列名（authorid/citedcorpusid/corpusid）
+        primary_key: 主键列名（authorid/corpusid/publicationvenueid）
     """
     if not batch:
         return 0
     
     from io import StringIO
     import psycopg2.errors
+    
+    # publication_venues表的主键是TEXT类型（UUID字符串），其他表是BIGINT
+    is_string_key = (table_name == 'publication_venues')
     
     try:
         if use_upsert:
@@ -496,7 +525,12 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
                 for key_val, data in chunk_items:
                     # 转义单引号
                     escaped_data = data.replace("'", "''")
-                    values_list.append(f"({key_val}, '{escaped_data}', NOW(), NOW())")
+                    # 字符串主键需要加引号，数字主键不需要
+                    if is_string_key:
+                        escaped_key = str(key_val).replace("'", "''")
+                        values_list.append(f"('{escaped_key}', '{escaped_data}', NOW(), NOW())")
+                    else:
+                        values_list.append(f"({key_val}, '{escaped_data}', NOW(), NOW())")
                 
                 values_clause = ','.join(values_list)
                 
@@ -514,24 +548,31 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
         else:
             # INSERT模式：极速COPY（TEXT类型，不验证不解析，最快）
             
-            # 特殊处理：citations表预去重（同一篇论文被多次引用导致高重复率）
+            # 特殊处理：citations表聚合合并（同一引用方可能引用多篇文献）
             if table_name == 'citations':
-                # 1. 批内去重（对citations表至关重要！减少58%的无效插入）
-                seen = {}
-                original_count = len(batch)
-                for key_value, data in batch:
-                    seen[key_value] = data  # 相同key保留最后一个
+                from collections import defaultdict
                 
-                dedup_count = len(seen)
-                if dedup_count == 0:
-                    return 0  # 批次为空，跳过
+                # 1. 批内聚合：按citingcorpusid分组（值从JSON提取，存入corpusid字段）
+                citations_agg = defaultdict(list)
+                for citing_id, json_line in batch:
+                    citations_agg[citing_id].append(json_line)
                 
-                # 2. 去重后直接COPY插入（无需ON CONFLICT检查，最快）
+                if not citations_agg:
+                    return 0
+                
+                # 2. 构建聚合数据（缓存JSON数组，避免重复构建）
+                agg_data = [
+                    (citing_id, "[" + ",".join(json_lines) + "]")
+                    for citing_id, json_lines in citations_agg.items()
+                ]
+                agg_count = len(agg_data)
+                
+                # 3. 构建COPY缓冲区（用于主表插入）
                 buffer = StringIO()
-                lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in seen.items()]
-                buffer.write(''.join(lines))
+                buffer.write(''.join(f"{cid}\t{data}\t\\N\t\\N\n" for cid, data in agg_data))
                 buffer.seek(0)
                 
+                # 4. 尝试直接COPY插入（最快路径）
                 try:
                     cursor.copy_expert(
                         f"""
@@ -540,49 +581,46 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
                         """,
                         buffer
                     )
-                    return dedup_count
+                    return agg_count
                 except psycopg2.errors.UniqueViolation:
-                    # 跨批次重复，使用预查询过滤法（静默处理，避免刷屏）
+                    # 5. 跨批次重复：使用临时表批量合并数组（最优方案）
                     cursor.connection.rollback()
                     
-                    # 1. 批量查询已存在的ID（一次索引查询，比N次ON CONFLICT快得多）
-                    seen_ids = list(seen.keys())
-                    if not seen_ids:
-                        return 0  # 无数据可查
-                        
-                    placeholders = ','.join(['%s'] * len(seen_ids))
-                    cursor.execute(f"""
-                        SELECT {primary_key} FROM {table_name} 
-                        WHERE {primary_key} IN ({placeholders})
-                    """, seen_ids)
+                    temp_table = f"temp_citations_{id(cursor)}"
                     
-                    existing_ids = set(row[0] for row in cursor.fetchall())
-                    
-                    # 2. 过滤掉已存在的ID
-                    new_items = {k: v for k, v in seen.items() if k not in existing_ids}
-                    
-                    if not new_items:
-                        return 0  # 全部已存在
-                    
-                    # 3. 直接COPY插入新数据（无需ON CONFLICT，最快）
-                    buffer = StringIO()
-                    lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in new_items.items()]
-                    buffer.write(''.join(lines))
-                    buffer.seek(0)
-                    
+                    # 创建临时表（仅首次）+ TRUNCATE清空（比DROP+CREATE快10倍）
                     try:
-                        cursor.copy_expert(
-                            f"""
-                            COPY {table_name} ({primary_key}, data, insert_time, update_time)
-                            FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
-                            """,
-                            buffer
-                        )
-                        return len(new_items)
-                    except Exception as e:
-                        # 如果还是失败（理论上不应该），静默跳过
+                        cursor.execute(f"TRUNCATE {temp_table}")
+                    except psycopg2.errors.UndefinedTable:
                         cursor.connection.rollback()
-                        return 0
+                        cursor.execute(f"""
+                            CREATE TEMP TABLE {temp_table} (
+                                corpusid BIGINT, 
+                                data TEXT
+                            ) ON COMMIT DELETE ROWS
+                        """)
+                    
+                    # 构建临时表buffer（只需2个字段：corpusid, data）
+                    temp_buffer = StringIO()
+                    temp_buffer.write(''.join(f"{cid}\t{data}\n" for cid, data in agg_data))
+                    temp_buffer.seek(0)
+                    
+                    # COPY到临时表（最快批量导入）
+                    cursor.copy_expert(
+                        f"COPY {temp_table} (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
+                        temp_buffer
+                    )
+                    
+                    # 批量UPSERT with 数组合并（纯文本操作，不解析JSON）
+                    cursor.execute(f"""
+                        INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
+                        SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
+                        ON CONFLICT (corpusid) DO UPDATE SET
+                            data = rtrim({table_name}.data, ']') || ',' || ltrim(EXCLUDED.data, '['),
+                            update_time = NOW()
+                    """)
+                    
+                    return agg_count
             
             else:
                 # 其他表：主键唯一，直接COPY（最快）
@@ -803,7 +841,8 @@ def main():
   🚀 多进程解压：充分利用多核CPU
   🚀 灵活主键配置：根据表名自动使用正确的主键字段
      - authors表使用authorid
-     - citations表使用citedcorpusid
+     - citations表使用corpusid（值从citingcorpusid提取，数据聚合为JSON数组）
+     - publication_venues表使用publicationvenueid（值从id提取，UUID字符串）
      - 其他表使用corpusid
 
 示例：
@@ -813,7 +852,7 @@ def main():
   # 处理authors文件夹（自动使用authorid作为主键）
   python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\authors" --table authors
   
-  # 处理citations文件夹（自动使用citedcorpusid作为主键）
+  # 处理citations文件夹（corpusid从citingcorpusid提取，聚合引用记录）
   python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\citations" --table citations
   
   # 自定义解压进程数（根据CPU核心数）
