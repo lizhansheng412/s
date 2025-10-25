@@ -9,10 +9,10 @@
   ✅ 队列缓冲：解压快时不等待，插入快时不空闲
   ✅ 断点续传：支持中断恢复
   ✅ 灵活主键配置：不同表使用不同主键字段
-     - authors表: authorid
-     - citations表: corpusid（值从citingcorpusid提取，数据聚合为JSON数组）
-     - publication_venues表: publicationvenueid（值从id提取，UUID字符串）
-     - 其他表: corpusid
+     - authors表: authorid (JSON字符串→DB BIGINT)
+     - citations表: id（自增），额外字段citingcorpusid（允许重复）
+     - publication_venues表: publicationvenueid (JSON字符串→DB TEXT，值从id提取)
+     - 其他表: corpusid (JSON数字→DB BIGINT)
   
 目标：10倍性能提升（3000-5000条/秒）
 """
@@ -32,7 +32,8 @@ import psycopg2
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from database.config.db_config_v2 import DB_CONFIG, FIELD_TABLES
+from database.config import db_config_v2
+from database.config.db_config_v2 import FIELD_TABLES
 
 # =============================================================================
 # 根据数据大小动态配置（关键优化！）
@@ -55,10 +56,14 @@ TABLE_CONFIGS = {
     'abstracts': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
     'authors': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
     'citations': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 1},
-    'paper_ids': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
     'publication_venues': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
     'tldrs': {'batch_size': 50000, 'commit_batches': 3, 'extractors': 2},
     # 50,000条×2KB×3批=300MB/批次
+    
+    # 极速模式：paper_ids（只有一个BIGINT字段，8字节/条）
+    # 大数据量优化：批次增大以分摊索引维护开销
+    'paper_ids': {'batch_size': 1000000, 'commit_batches': 1, 'extractors': 3},
+    # 100万条×8字节×1批=8MB/批次（极小，极速，减少commit次数）
 }
 
 DEFAULT_CONFIG = {'batch_size': 20000, 'commit_batches': 1, 'extractors': 1}
@@ -67,18 +72,35 @@ QUEUE_SIZE = 20
 # 日志文件路径（将根据表名动态生成）
 PROGRESS_DIR = 'logs/progress'
 FAILED_DIR = 'logs/failed'
+ALWAYS_FAILED_DIR = 'logs/always_failed'
 
 # 不同表使用不同的主键字段（数据库字段名）
 TABLE_PRIMARY_KEY_MAP = {
     'authors': 'authorid',
-    'citations': 'corpusid',  # 数据库字段名是corpusid（保持一致性）
     'publication_venues': 'publicationvenueid',
+    # citations表使用自增主键，无需在此配置
     # 其他表默认使用corpusid
+}
+
+# JSON中主键字段是字符串格式的表（需要用引号匹配正则表达式）
+JSON_STRING_KEY_TABLES = {
+    'authors',  # JSON: "authorid":"5232161" (带引号)，DB: BIGINT (需转换)
+    'publication_venues'  # JSON: "id":"uuid-..." (带引号)，DB: TEXT (保持字符串)
+}
+
+# 只需插入主键的表（无data字段）
+NO_DATA_TABLES = {
+    'paper_ids'  # 只插入corpusid，其他字段使用默认值
+}
+
+# 数据库中主键是TEXT类型的表（插入时不需要转换）
+DB_TEXT_KEY_TABLES = {
+    'publication_venues'  # publicationvenueid是TEXT类型（UUID字符串）
 }
 
 # JSON字段名到数据库字段名的映射（用于正则提取）
 JSON_FIELD_MAP = {
-    'citations': 'citingcorpusid',  # JSON中的citingcorpusid字段对应数据库的corpusid
+    'citations': 'citingcorpusid',  # 从JSON的citingcorpusid字段提取值
     'publication_venues': 'id',  # JSON中的id字段对应数据库的publicationvenueid
     # 其他表的JSON字段名和数据库字段名一致，使用数据库字段名即可
 }
@@ -107,19 +129,22 @@ def get_log_files(table_name: str):
         table_name: 表名
     
     Returns:
-        (progress_file, failed_file) 元组
+        (progress_file, failed_file, always_failed_file) 元组
     """
     progress_dir = Path(PROGRESS_DIR)
     failed_dir = Path(FAILED_DIR)
+    always_failed_dir = Path(ALWAYS_FAILED_DIR)
     
     # 创建目录
     progress_dir.mkdir(parents=True, exist_ok=True)
     failed_dir.mkdir(parents=True, exist_ok=True)
+    always_failed_dir.mkdir(parents=True, exist_ok=True)
     
     progress_file = progress_dir / f"{table_name}_progress.txt"
     failed_file = failed_dir / f"{table_name}_failed.txt"
+    always_failed_file = always_failed_dir / f"{table_name}_failed.txt"
     
-    return str(progress_file), str(failed_file)
+    return str(progress_file), str(failed_file), str(always_failed_file)
 
 # 设置日志级别为ERROR，只显示错误信息
 logging.basicConfig(
@@ -165,11 +190,15 @@ class ProgressTracker:
 
 
 class FailedFilesLogger:
-    """失败文件记录器"""
+    """失败文件记录器（支持 failed 和 always_failed）"""
     
-    def __init__(self, failed_file: str):
+    def __init__(self, failed_file: str, always_failed_file: str = None, is_retry: bool = False):
         self.failed_file = Path(failed_file)
+        self.always_failed_file = Path(always_failed_file) if always_failed_file else None
+        self.is_retry = is_retry
         self.failed_file.parent.mkdir(parents=True, exist_ok=True)
+        if self.always_failed_file:
+            self.always_failed_file.parent.mkdir(parents=True, exist_ok=True)
     
     def load_failed(self) -> Set[str]:
         """加载已知失败的文件列表"""
@@ -181,7 +210,6 @@ class FailedFilesLogger:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    # 提取文件名（格式：时间戳 | 文件名 | 错误信息）
                     parts = line.split('|')
                     if len(parts) >= 2:
                         failed.add(parts[1].strip())
@@ -192,9 +220,41 @@ class FailedFilesLogger:
         """记录失败文件"""
         from datetime import datetime
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(self.failed_file, 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp} | {file_name} | {error}\n")
-            f.flush()
+        
+        try:
+            # 重试模式：失败记录到 always_failed
+            if self.is_retry and self.always_failed_file:
+                with open(self.always_failed_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{timestamp} | {file_name} | {error}\n")
+                    f.flush()
+            else:
+                # 首次处理：记录到 failed
+                with open(self.failed_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{timestamp} | {file_name} | {error}\n")
+                    f.flush()
+        except Exception as e:
+            logger.error(f"记录失败文件日志时出错: {e}")
+    
+    def remove_from_failed(self, file_name: str):
+        """从 failed 中删除记录（重试成功时调用）"""
+        if not self.failed_file.exists():
+            return
+        
+        try:
+            lines = []
+            with open(self.failed_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    # 精确匹配文件名（格式：时间戳 | 文件名 | 错误信息）
+                    parts = line.split('|')
+                    if len(parts) >= 2 and parts[1].strip() != file_name:
+                        lines.append(line)
+            
+            # 写回文件
+            with open(self.failed_file, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+        except Exception as e:
+            # 删除失败不影响主流程，记录日志即可
+            logger.warning(f"从 failed 日志中删除记录失败: {e}")
     
     def reset(self):
         if self.failed_file.exists():
@@ -224,9 +284,11 @@ def extractor_worker(
     primary_key_field = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
     # 确定JSON中对应的字段名（用于正则提取）
     json_field_name = JSON_FIELD_MAP.get(table_name, primary_key_field)
-    # publication_venues表的主键是UUID字符串，其他表是数字
-    is_uuid = (table_name == 'publication_venues')
-    key_pattern = get_key_pattern(json_field_name, is_uuid=is_uuid)
+    # 判断JSON中主键是否是字符串格式（用于正则匹配）
+    is_json_string = table_name in JSON_STRING_KEY_TABLES
+    # 判断数据库中主键是否是TEXT类型（用于决定是否转换）
+    is_db_text = table_name in DB_TEXT_KEY_TABLES
+    key_pattern = get_key_pattern(json_field_name, is_uuid=is_json_string)
     
     worker_name = f"Extractor-{id(file_queue) % 1000}"
     
@@ -265,8 +327,10 @@ def extractor_worker(
                             if not match:
                                 continue
                             
-                            # 提取主键值（UUID字符串或数字）
-                            key_value = match.group(1) if is_uuid else int(match.group(1))
+                            # 提取主键值
+                            # - 如果DB是TEXT类型，保持字符串（如publication_venues）
+                            # - 否则转换为int（如authors的authorid虽然JSON是字符串，但DB是BIGINT）
+                            key_value = match.group(1) if is_db_text else int(match.group(1))
                             valid_count += 1
                             
                             # 优化：直接使用原始行，避免不必要的转义检查
@@ -315,7 +379,10 @@ def inserter_worker(
     use_upsert: bool = False,
     commit_batches: int = 3,
     total_files: int = 0,
-    primary_key: str = 'corpusid'
+    primary_key: str = 'corpusid',
+    is_retry: bool = False,
+    initial_completed: int = 0,
+    db_config: dict = None
 ):
     """
     插入工作进程（消费者）
@@ -323,10 +390,13 @@ def inserter_worker(
     
     Args:
         primary_key: 主键字段名（默认corpusid）
+        db_config: 数据库配置字典
     """
     try:
         # 创建数据库连接
-        conn = psycopg2.connect(**DB_CONFIG)
+        if db_config is None:
+            db_config = db_config_v2.DB_CONFIG
+        conn = psycopg2.connect(**db_config)
         conn.autocommit = False
         cursor = conn.cursor()
         
@@ -370,7 +440,7 @@ def inserter_worker(
         
         total_inserted = 0
         file_stats = {}  # {file_name: inserted_count}
-        completed_files = 0
+        completed_files = 0  # 当前批次完成的文件数
         last_log_time = time.time()
         start_time = time.time()
         batch_count = 0  # 批次计数器
@@ -414,38 +484,44 @@ def inserter_worker(
                     if current_time - last_log_time >= 3:
                         elapsed = current_time - start_time
                         rate = total_inserted / elapsed if elapsed > 0 else 0
-                        progress_pct = (completed_files / total_files * 100) if total_files > 0 else 0
                         
-                        # 估算剩余时间：必须完成至少1个文件才能准确估算
+                        # 总进度（包含初始已完成的文件）
+                        total_completed_now = initial_completed + completed_files
+                        total_all_files = initial_completed + total_files
+                        overall_progress = (total_completed_now / total_all_files * 100) if total_all_files > 0 else 0
+                        
+                        # 估算剩余时间
                         if completed_files > 0:
-                            # 基于已完成文件的平均时间估算剩余时间
                             avg_time_per_file = elapsed / completed_files
                             remaining_files = total_files - completed_files
                             eta_seconds = remaining_files * avg_time_per_file
                             eta_hours = int(eta_seconds / 3600)
                             eta_mins = int((eta_seconds % 3600) / 60)
-                            eta_str = f"{eta_hours}小时{eta_mins}分" if eta_hours > 0 else f"{eta_mins}分"
+                            eta_str = f"{eta_hours}h{eta_mins}m" if eta_hours > 0 else f"{eta_mins}m"
                         else:
-                            # 没有完成文件时，显示"计算中..."而不是"0分"
-                            eta_str = "计算中..."
+                            eta_str = "calculating..."
                         
-                        print(f"\r📊 [{completed_files}/{total_files}] {progress_pct:.1f}% | "
-                              f"{total_inserted:,}条 | {rate:.0f}条/秒 | "
-                              f"剩余: {eta_str}    ", end='', flush=True)
+                        # 显示：总进度（包含初始已完成的）
+                        print(f"\r[{total_completed_now}/{total_all_files}] {overall_progress:.1f}% | "
+                              f"{total_inserted:,} rows | {rate:.0f}/s | "
+                              f"ETA: {eta_str}    ", end='', flush=True)
                         last_log_time = current_time
                 
                 elif item_type == 'done':
                     _, file_name, _ = item
                     # 标记文件完成
                     tracker.mark_completed(file_name)
+                    # 重试成功：从 failed 中删除
+                    if is_retry:
+                        failed_logger.remove_from_failed(file_name)
                     completed_files += 1
                     inserted = file_stats.get(file_name, 0)
                 
                 elif item_type == 'error':
                     _, file_name, error = item
-                    # 记录失败文件（不标记为已完成）
+                    # 记录失败文件
                     failed_logger.log_failed(file_name, error)
-                    completed_files += 1  # 计数但不标记为成功
+                    completed_files += 1
             
             except Empty:
                 # 队列空，继续等待
@@ -483,8 +559,9 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
     数据以TEXT格式存储（不验证不解析，极速）
     
     注意：
+    - paper_ids表：只插入corpusid字段，无data字段（极速模式）
     - authors表：主键列名是authorid (BIGINT)
-    - citations表：主键列名是corpusid (BIGINT)，值从citingcorpusid提取，data聚合为JSON数组
+    - citations表：主键是id (BIGSERIAL自增)，citingcorpusid为普通字段
     - publication_venues表：主键列名是publicationvenueid (TEXT)，值从id提取（UUID字符串）
     - 其他表：主键列名是corpusid (BIGINT)
     
@@ -493,7 +570,7 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
         table_name: 表名
         batch: 数据批次 [(key_value, json_line), ...] - key_value已从JSON正确字段提取
         use_upsert: 是否使用UPSERT模式
-        primary_key: 主键列名（authorid/corpusid/publicationvenueid）
+        primary_key: 主键列名（authorid/publicationvenueid/corpusid，citations表无需）
     """
     if not batch:
         return 0
@@ -501,193 +578,158 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
     from io import StringIO
     import psycopg2.errors
     
-    # publication_venues表的主键是TEXT类型（UUID字符串），其他表是BIGINT
-    is_string_key = (table_name == 'publication_venues')
+    # 检查数据库主键是否是TEXT类型（用于VALUES语句格式化）
+    is_string_key = table_name in DB_TEXT_KEY_TABLES
     
     try:
-        if use_upsert:
-            # UPSERT模式 - 优化版本
-            # 1. 批内去重（字典更快）
-            seen = {}
-            for key_value, data in batch:
-                seen[key_value] = data
+        # paper_ids表特殊处理：只插入corpusid，无其他字段（极速模式）
+        if table_name == 'paper_ids':
+            # 批内去重（只保留唯一corpusid）
+            unique_ids = list(set(key_val for key_val, _ in batch))
             
-            # 2. 使用VALUES批量UPSERT（避免临时表耗尽缓冲区）
-            # 分小批次插入，每次最多1000条
+            buffer = StringIO()
+            # 只插入corpusid，无时间戳字段（极速优化）
+            buffer.write(''.join(f"{cid}\n" for cid in unique_ids))
+            buffer.seek(0)
+            
+            try:
+                # 只插入corpusid字段，其他字段使用默认值
+                cursor.copy_expert(
+                    f"COPY {table_name} (corpusid) FROM STDIN",
+                    buffer
+                )
+                return len(unique_ids)
+            except psycopg2.errors.UniqueViolation:
+                # 有重复key，预查询过滤（断点续传场景）
+                cursor.connection.rollback()
+                
+                # 批量查询已存在的ID（分批查询，避免占用过多内存）
+                chunk_size = 100000
+                existing_ids = set()
+                
+                for i in range(0, len(unique_ids), chunk_size):
+                    chunk = unique_ids[i:i + chunk_size]
+                    placeholders = ','.join(['%s'] * len(chunk))
+                    cursor.execute(
+                        f"SELECT corpusid FROM {table_name} WHERE corpusid IN ({placeholders})",
+                        chunk
+                    )
+                    existing_ids.update(row[0] for row in cursor.fetchall())
+                
+                # 过滤并插入新数据
+                new_ids = [cid for cid in unique_ids if cid not in existing_ids]
+                if not new_ids:
+                    return 0
+                
+                buffer = StringIO()
+                buffer.write(''.join(f"{cid}\n" for cid in new_ids))
+                buffer.seek(0)
+                
+                try:
+                    cursor.copy_expert(
+                        f"COPY {table_name} (corpusid) FROM STDIN",
+                        buffer
+                    )
+                    return len(new_ids)
+                except Exception:
+                    cursor.connection.rollback()
+                    return 0
+        
+        # 以下是其他表的原有逻辑
+        elif use_upsert:
+            # UPSERT模式：批内去重 + 分批插入
+            seen = {key_value: data for key_value, data in batch}
             chunk_size = 1000
             total_processed = 0
             
             for i in range(0, len(seen), chunk_size):
-                chunk_items = list(seen.items())[i:i + chunk_size]
+                chunk = list(seen.items())[i:i + chunk_size]
                 
-                # 构建VALUES子句
+                # 构建VALUES子句（字符串主键需加引号）
                 values_list = []
-                for key_val, data in chunk_items:
-                    # 转义单引号
-                    escaped_data = data.replace("'", "''")
-                    # 字符串主键需要加引号，数字主键不需要
+                for k, v in chunk:
+                    escaped_data = v.replace("'", "''")
                     if is_string_key:
-                        escaped_key = str(key_val).replace("'", "''")
+                        escaped_key = str(k).replace("'", "''")
                         values_list.append(f"('{escaped_key}', '{escaped_data}', NOW(), NOW())")
                     else:
-                        values_list.append(f"({key_val}, '{escaped_data}', NOW(), NOW())")
+                        values_list.append(f"({k}, '{escaped_data}', NOW(), NOW())")
+                values = ','.join(values_list)
                 
-                values_clause = ','.join(values_list)
-                
-                # 批量UPSERT
                 cursor.execute(f"""
                     INSERT INTO {table_name} ({primary_key}, data, insert_time, update_time)
-                    VALUES {values_clause}
+                    VALUES {values}
                     ON CONFLICT ({primary_key}) DO UPDATE SET
-                        data = EXCLUDED.data,
-                        update_time = EXCLUDED.update_time
+                        data = EXCLUDED.data, update_time = EXCLUDED.update_time
                 """)
-                total_processed += len(chunk_items)
+                total_processed += len(chunk)
             
             return total_processed
         else:
             # INSERT模式：极速COPY（TEXT类型，不验证不解析，最快）
             
-            # 特殊处理：citations表聚合合并（同一引用方可能引用多篇文献）
+            # citations表：自增主键，直接插入citingcorpusid字段
             if table_name == 'citations':
-                from collections import defaultdict
+                buffer = StringIO()
+                buffer.write(''.join(f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch))
+                buffer.seek(0)
                 
-                # 1. 批内聚合：按citingcorpusid分组（值从JSON提取，存入corpusid字段）
-                citations_agg = defaultdict(list)
-                for citing_id, json_line in batch:
-                    citations_agg[citing_id].append(json_line)
+                cursor.copy_expert(
+                    f"COPY {table_name} (citingcorpusid, data, insert_time, update_time) "
+                    f"FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')",
+                    buffer
+                )
+                return len(batch)
+            
+            # 其他表：主键唯一，处理冲突
+            buffer = StringIO()
+            buffer.write(''.join(f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch))
+            buffer.seek(0)
+            
+            try:
+                cursor.copy_expert(
+                    f"COPY {table_name} ({primary_key}, data, insert_time, update_time) "
+                    f"FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')",
+                    buffer
+                )
+                return len(batch)
+            except psycopg2.errors.UniqueViolation:
+                # 有重复key，使用预查询过滤法
+                cursor.connection.rollback()
                 
-                if not citations_agg:
+                batch_ids = [key_val for key_val, _ in batch]
+                if not batch_ids:
                     return 0
                 
-                # 2. 构建聚合数据（缓存JSON数组，避免重复构建）
-                agg_data = [
-                    (citing_id, "[" + ",".join(json_lines) + "]")
-                    for citing_id, json_lines in citations_agg.items()
-                ]
-                agg_count = len(agg_data)
+                # 批量查询已存在的ID
+                placeholders = ','.join(['%s'] * len(batch_ids))
+                cursor.execute(
+                    f"SELECT {primary_key} FROM {table_name} WHERE {primary_key} IN ({placeholders})",
+                    batch_ids
+                )
+                existing_ids = set(row[0] for row in cursor.fetchall())
                 
-                # 3. 构建COPY缓冲区（用于主表插入）
-                buffer = StringIO()
-                buffer.write(''.join(f"{cid}\t{data}\t\\N\t\\N\n" for cid, data in agg_data))
-                buffer.seek(0)
+                # 过滤并插入新数据
+                new_batch = [(k, v) for k, v in batch if k not in existing_ids]
+                if not new_batch:
+                    return 0
                 
-                # 4. 尝试直接COPY插入（最快路径）
-                try:
-                    cursor.copy_expert(
-                        f"""
-                        COPY {table_name} ({primary_key}, data, insert_time, update_time)
-                        FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
-                        """,
-                        buffer
-                    )
-                    return agg_count
-                except psycopg2.errors.UniqueViolation:
-                    # 5. 跨批次重复：使用临时表批量合并数组（最优方案）
-                    cursor.connection.rollback()
-                    
-                    temp_table = f"temp_citations_{id(cursor)}"
-                    
-                    # 创建临时表（仅首次）+ TRUNCATE清空（比DROP+CREATE快10倍）
-                    try:
-                        cursor.execute(f"TRUNCATE {temp_table}")
-                    except psycopg2.errors.UndefinedTable:
-                        cursor.connection.rollback()
-                        cursor.execute(f"""
-                            CREATE TEMP TABLE {temp_table} (
-                                corpusid BIGINT, 
-                                data TEXT
-                            ) ON COMMIT DELETE ROWS
-                        """)
-                    
-                    # 构建临时表buffer（只需2个字段：corpusid, data）
-                    temp_buffer = StringIO()
-                    temp_buffer.write(''.join(f"{cid}\t{data}\n" for cid, data in agg_data))
-                    temp_buffer.seek(0)
-                    
-                    # COPY到临时表（最快批量导入）
-                    cursor.copy_expert(
-                        f"COPY {temp_table} (corpusid, data) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')",
-                        temp_buffer
-                    )
-                    
-                    # 批量UPSERT with 数组合并（纯文本操作，不解析JSON）
-                    cursor.execute(f"""
-                        INSERT INTO {table_name} (corpusid, data, insert_time, update_time)
-                        SELECT corpusid, data, NOW(), NOW() FROM {temp_table}
-                        ON CONFLICT (corpusid) DO UPDATE SET
-                            data = rtrim({table_name}.data, ']') || ',' || ltrim(EXCLUDED.data, '['),
-                            update_time = NOW()
-                    """)
-                    
-                    return agg_count
-            
-            else:
-                # 其他表：主键唯一，直接COPY（最快）
                 buffer = StringIO()
-                lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch]
-                buffer.write(''.join(lines))
+                buffer.write(''.join(f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in new_batch))
                 buffer.seek(0)
                 
                 try:
                     cursor.copy_expert(
-                        f"""
-                        COPY {table_name} ({primary_key}, data, insert_time, update_time)
-                        FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
-                        """,
+                        f"COPY {table_name} ({primary_key}, data, insert_time, update_time) "
+                        f"FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')",
                         buffer
                     )
-                    return len(batch)
-                except psycopg2.errors.UniqueViolation:
-                    # 有重复key（静默处理，使用预查询过滤法）
+                    return len(new_batch)
+                except Exception:
                     cursor.connection.rollback()
-                    
-                    # 1. 提取所有ID
-                    batch_ids = [key_val for key_val, _ in batch]
-                    if not batch_ids:
-                        return 0  # 无数据可查
-                        
-                    placeholders = ','.join(['%s'] * len(batch_ids))
-                    
-                    # 2. 批量查询已存在的ID
-                    cursor.execute(f"""
-                        SELECT {primary_key} FROM {table_name} 
-                        WHERE {primary_key} IN ({placeholders})
-                    """, batch_ids)
-                    
-                    existing_ids = set(row[0] for row in cursor.fetchall())
-                    
-                    # 3. 过滤掉已存在的ID
-                    new_batch = [(k, v) for k, v in batch if k not in existing_ids]
-                    
-                    if not new_batch:
-                        return 0  # 全部已存在
-                    
-                    # 4. 直接COPY插入新数据
-                    buffer = StringIO()
-                    lines = [f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in new_batch]
-                    buffer.write(''.join(lines))
-                    buffer.seek(0)
-                    
-                    try:
-                        cursor.copy_expert(
-                            f"""
-                            COPY {table_name} ({primary_key}, data, insert_time, update_time)
-                            FROM STDIN WITH (FORMAT TEXT, NULL '\\N', DELIMITER E'\\t')
-                            """,
-                            buffer
-                        )
-                        return len(new_batch)
-                    except Exception as e:
-                        # 静默跳过
-                        cursor.connection.rollback()
-                        return 0
+                    return 0
         
-    except psycopg2.errors.UniqueViolation:
-        # 如果还是失败，说明事务已中止，需要外层处理
-        raise
     except Exception as e:
-        # 其他错误
         import traceback
         logger.error(f"批量插入失败: {e}")
         logger.error(f"详细信息: {traceback.format_exc()}")
@@ -705,7 +747,8 @@ def process_gz_folder_pipeline(
     num_extractors: int = NUM_EXTRACTORS,
     resume: bool = True,
     reset_progress: bool = False,
-    retry_failed: bool = False
+    retry_failed: bool = False,
+    is_retry: bool = False
 ):
     """
     流水线并行处理：多个解压进程 + 单个插入进程
@@ -715,11 +758,11 @@ def process_gz_folder_pipeline(
         raise ValueError(f"文件夹不存在: {folder_path}")
     
     # 根据表名获取专属的日志文件路径
-    progress_file, failed_file = get_log_files(table_name)
+    progress_file, failed_file, always_failed_file = get_log_files(table_name)
     
     # 初始化进度跟踪（每个表独立的日志文件）
     tracker = ProgressTracker(progress_file)
-    failed_logger = FailedFilesLogger(failed_file)
+    failed_logger = FailedFilesLogger(failed_file, always_failed_file, is_retry)
     
     if reset_progress:
         tracker.reset()
@@ -735,9 +778,15 @@ def process_gz_folder_pipeline(
         logger.warning(f"未找到.gz文件: {folder_path}")
         return
     
+    total_gz_count = len(gz_files)
+    
     # 过滤：排除已完成的文件，以及已知失败的文件（除非retry_failed=True）
     excluded_files = completed_files | failed_files
     pending_files = [(str(f), f.name) for f in gz_files if f.name not in excluded_files]
+    
+    # 统计信息
+    completed_count = len(completed_files)
+    failed_count = len(failed_files)
     
     # 获取该表使用的主键字段
     primary_key_field = TABLE_PRIMARY_KEY_MAP.get(table_name, 'corpusid')
@@ -751,11 +800,11 @@ def process_gz_folder_pipeline(
         num_extractors = config['extractors']
     
     # 精简输出：一行显示核心信息
-    failed_info = f", 失败: {len(failed_files)}" if failed_files else ""
-    logger.info(f"\n▶ [{table_name}] 总计: {len(gz_files)}, 已完成: {len(completed_files)}{failed_info}, 待处理: {len(pending_files)}")
+    failed_info = f", failed: {failed_count}" if failed_files else ""
+    logger.info(f"\n[{table_name}] Total: {total_gz_count}, Completed: {completed_count}{failed_info}, Pending: {len(pending_files)}")
     
     if not pending_files:
-        logger.info("✅ 所有文件已处理完成！\n")
+        logger.info("All files processed!\n")
         return
     
     overall_start = time.time()
@@ -778,9 +827,11 @@ def process_gz_folder_pipeline(
             file_queue.put(None)
         
         # 启动插入进程（消费者）
+        # 传入总文件数和已完成数，用于正确显示进度
+        # 传入当前的 DB_CONFIG 确保子进程使用正确的数据库配置
         inserter = Process(
             target=inserter_worker,
-            args=(data_queue, table_name, stats_dict, tracker, failed_logger, use_upsert, commit_batches, len(pending_files), primary_key_field),
+            args=(data_queue, table_name, stats_dict, tracker, failed_logger, use_upsert, commit_batches, len(pending_files), primary_key_field, is_retry, completed_count, db_config_v2.DB_CONFIG.copy()),
             name='Inserter'
         )
         inserter.start()
@@ -810,13 +861,13 @@ def process_gz_folder_pipeline(
         total_inserted = stats_dict.get('inserted', 0)
         avg_rate = total_inserted / elapsed if elapsed > 0 else 0
         
-        logger.info(f"✅ [{table_name}] 完成: {len(pending_files)}个文件, {total_inserted:,}条, {elapsed/60:.1f}分钟, {avg_rate:.0f}条/秒\n")
+        logger.info(f"[{table_name}] DONE: {len(pending_files)} files, {total_inserted:,} rows, {elapsed/60:.1f} min, {avg_rate:.0f} rows/s\n")
         
     except KeyboardInterrupt:
-        logger.warning("\n⚠️  用户中断（进度已保存）")
+        logger.warning("\nInterrupted by user (progress saved)")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"\n❌ 处理失败: {e}")
+        logger.error(f"\nProcessing failed: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -841,7 +892,7 @@ def main():
   🚀 多进程解压：充分利用多核CPU
   🚀 灵活主键配置：根据表名自动使用正确的主键字段
      - authors表使用authorid
-     - citations表使用corpusid（值从citingcorpusid提取，数据聚合为JSON数组）
+     - citations表使用自增id，citingcorpusid为普通字段（允许重复，极速插入）
      - publication_venues表使用publicationvenueid（值从id提取，UUID字符串）
      - 其他表使用corpusid
 
@@ -852,7 +903,7 @@ def main():
   # 处理authors文件夹（自动使用authorid作为主键）
   python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\authors" --table authors
   
-  # 处理citations文件夹（corpusid从citingcorpusid提取，聚合引用记录）
+  # 处理citations文件夹（自增主键，极速插入，无需去重）
   python scripts/stream_gz_to_db_optimized.py --dir "E:\\machine_win01\\2025-09-30\\citations" --table citations
   
   # 自定义解压进程数（根据CPU核心数）

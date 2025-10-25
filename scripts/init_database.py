@@ -13,7 +13,8 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from database.config.db_config_v2 import DB_CONFIG, FIELD_TABLES, TABLESPACE_CONFIG
+from database.config import db_config_v2
+from database.config.db_config_v2 import FIELD_TABLES, TABLESPACE_CONFIG, get_db_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -28,10 +29,10 @@ def get_connection_params(database='postgres'):
     """Get connection parameters with forced settings"""
     params = {
         'host': '127.0.0.1',  # Use 127.0.0.1 instead of localhost
-        'port': DB_CONFIG['port'],
+        'port': db_config_v2.DB_CONFIG['port'],
         'database': database,
-        'user': DB_CONFIG['user'],
-        'password': DB_CONFIG['password'],
+        'user': db_config_v2.DB_CONFIG['user'],
+        'password': db_config_v2.DB_CONFIG['password'],
         'options': '-c lc_messages=C -c client_encoding=UTF8'
     }
     return params
@@ -39,7 +40,7 @@ def get_connection_params(database='postgres'):
 
 def create_database():
     """Create database if not exists"""
-    db_name = DB_CONFIG['database']
+    db_name = db_config_v2.DB_CONFIG['database']
     
     try:
         conn = psycopg2.connect(**get_connection_params('postgres'))
@@ -105,7 +106,7 @@ def create_database():
 def create_tables(tables: list = None):
     """Create tables (UNLOGGED, no indexes, TEXT type for data)"""
     try:
-        conn = psycopg2.connect(**get_connection_params(DB_CONFIG['database']))
+        conn = psycopg2.connect(**get_connection_params(db_config_v2.DB_CONFIG['database']))
         conn.autocommit = True
         cursor = conn.cursor()
         
@@ -127,7 +128,6 @@ def create_tables(tables: list = None):
         # 不同表使用不同的主键列名和类型
         TABLE_PRIMARY_KEY_MAP = {
             'authors': ('authorid', 'BIGINT'),
-            'citations': ('corpusid', 'BIGINT'),  # 数据库字段名是corpusid（值从citingcorpusid提取）
             'publication_venues': ('publicationvenueid', 'TEXT'),  # UUID字符串
         }
         
@@ -136,25 +136,65 @@ def create_tables(tables: list = None):
                 logger.warning(f"跳过无效表: {table_name}")
                 continue
             
-            # 确定主键列名和类型
-            primary_key, key_type = TABLE_PRIMARY_KEY_MAP.get(table_name, ('corpusid', 'BIGINT'))
+            logger.info(f"创建表: {table_name}")
             
-            logger.info(f"创建表: {table_name} (主键: {primary_key} {key_type})")
+            # paper_ids表特殊处理：数据合并状态追踪表（极速导入优化版）
+            if table_name == 'paper_ids':
+                cursor.execute(f"""
+                    CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
+                        corpusid BIGINT PRIMARY KEY,
+                        
+                        -- 10个数据源状态字段 (0=未开始, 1=成功, 2=失败)
+                        papers SMALLINT DEFAULT 0,
+                        abstracts SMALLINT DEFAULT 0,
+                        tldrs SMALLINT DEFAULT 0,
+                        s2orc SMALLINT DEFAULT 0,
+                        s2orc_v2 SMALLINT DEFAULT 0,
+                        citations SMALLINT DEFAULT 0,
+                        authors SMALLINT DEFAULT 0,
+                        embeddings_specter_v1 SMALLINT DEFAULT 0,
+                        embeddings_specter_v2 SMALLINT DEFAULT 0,
+                        publication_venues SMALLINT DEFAULT 0
+                        
+                        -- 注意：merge_status 列在数据导入完成后添加（性能优化）
+                        -- 注意：时间戳字段已删除（极速插入优化）
+                    ){tablespace_clause}
+                """)
+                logger.info(f"  ✓ 表 {table_name} 创建成功 (主键: corpusid, 10个数据源字段)")
+                logger.info(f"  ⚡ 极速模式：无时间戳，无 merge_status（数据导入完成后添加）")
             
-            # 不同表使用不同的主键列名和类型（data为TEXT类型，不验证不解析，最快）
-            # 表会继承数据库的表空间，但也可以显式指定
-            cursor.execute(f"""
-                CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
-                    {primary_key} {key_type} PRIMARY KEY,
-                    data TEXT,
-                    insert_time TIMESTAMP DEFAULT NOW(),
-                    update_time TIMESTAMP DEFAULT NOW()
-                ){tablespace_clause}
-            """)
+            # citations表特殊处理：自增主键 + citingcorpusid字段
+            elif table_name == 'citations':
+                cursor.execute(f"""
+                    CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
+                        id BIGSERIAL PRIMARY KEY,
+                        citingcorpusid BIGINT,
+                        data TEXT,
+                        insert_time TIMESTAMP DEFAULT NOW(),
+                        update_time TIMESTAMP DEFAULT NOW()
+                    ){tablespace_clause}
+                """)
+                # 为citingcorpusid创建索引（用于查询）
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_citations_citingcorpusid 
+                    ON {table_name}(citingcorpusid)
+                """)
+                logger.info(f"  ✓ 表 {table_name} 创建成功 (主键: id BIGSERIAL, 索引: citingcorpusid)")
+            else:
+                # 其他表：使用配置的主键
+                primary_key, key_type = TABLE_PRIMARY_KEY_MAP.get(table_name, ('corpusid', 'BIGINT'))
+                
+                cursor.execute(f"""
+                    CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
+                        {primary_key} {key_type} PRIMARY KEY,
+                        data TEXT,
+                        insert_time TIMESTAMP DEFAULT NOW(),
+                        update_time TIMESTAMP DEFAULT NOW()
+                    ){tablespace_clause}
+                """)
+                logger.info(f"  ✓ 表 {table_name} 创建成功 (主键: {primary_key} {key_type})")
             
             cursor.execute(f"ALTER TABLE {table_name} SET (autovacuum_enabled = false)")
-            
-            logger.info(f"  ✓ 表 {table_name} 创建成功 (主键: {primary_key} {key_type}, 数据: TEXT类型)")
         
         logger.info(f"\n{'='*80}")
         logger.info(f"已创建表: {len(tables_to_create)}/{len(FIELD_TABLES)}")
@@ -185,12 +225,19 @@ Examples:
     )
     parser.add_argument('--init', action='store_true', help='Create database and tables')
     parser.add_argument('--tables', nargs='+', help='Table names to create')
-    parser.add_argument('--machine', type=str, choices=['machine1', 'machine2', 'machine3', 'machine4'],
+    parser.add_argument('--machine', type=str, choices=['machine1', 'machine2', 'machine3', 'machine0'],
                        help='Machine ID')
     
     args = parser.parse_args()
     
     if args.init:
+        # 根据机器ID更新数据库配置
+        if args.machine:
+            db_config = get_db_config(args.machine)
+            db_config_v2.DB_CONFIG.update(db_config)
+            logger.info(f"Machine: {args.machine}")
+            logger.info(f"Database: {db_config_v2.DB_CONFIG['database']}\n")
+        
         create_database()
         
         tables = None

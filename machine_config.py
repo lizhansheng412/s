@@ -18,10 +18,10 @@ MACHINE_CONFIGS = {
         'tables': ['abstracts', 'authors', 'papers', 'publication_venues', 'tldrs', 'citations'],
         'description': 'Machine 3: Process abstracts, authors, papers, publication_venues, tldrs, citations (citations last due to slow processing)'
     },
-    'machine4': {
+    'machine0': {
         'folders': ['paper-ids'],
         'tables': ['paper_ids'],
-        'description': 'Machine 4: Process paper-ids'
+        'description': 'Machine 0: Process paper-ids'
     }
 }
 
@@ -30,7 +30,7 @@ def get_machine_config(machine_id: str) -> dict:
     Get machine configuration
     
     Args:
-        machine_id: Machine ID ('machine1', 'machine2', 'machine3', 'machine4')
+        machine_id: Machine ID ('machine1', 'machine2', 'machine3', 'machine0')
     
     Returns:
         Machine configuration dict
