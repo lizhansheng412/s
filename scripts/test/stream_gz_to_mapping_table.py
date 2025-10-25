@@ -20,9 +20,9 @@ import psycopg2
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from database.config import get_db_config
 
-# 配置参数（USB硬盘优化：超大事务，极少commit）
-BATCH_SIZE = 1000000  # 100万条/批次（corpusid只有8字节）
-COMMIT_BATCHES = 20   # 每20批次提交（2000万条/事务，约160MB，减少USB硬盘写入次数）
+# 配置参数（平衡性能和稳定性）
+BATCH_SIZE = 500000   # 50万条/批次（corpusid只有8字节）
+COMMIT_BATCHES = 6    # 每6批次提交（300万条/事务，约24MB）
 NUM_EXTRACTORS = 4
 QUEUE_SIZE = 30
 
@@ -213,17 +213,13 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
         conn.autocommit = False
         cursor = conn.cursor()
         
-        # 数据库性能优化（会话级别）
+        # 数据库性能优化（会话级别，保守配置）
         try:
-            cursor.execute("SET synchronous_commit = OFF")  # 异步提交
-            cursor.execute("SET commit_delay = 200000")  # 200ms延迟提交
-            cursor.execute("SET work_mem = '2GB'")
-            cursor.execute("SET maintenance_work_mem = '4GB'")
-            cursor.execute("SET temp_buffers = '1GB'")
-            cursor.execute("SET effective_cache_size = '16GB'")
-            logger.info("✅ 会话优化已启用")
+            cursor.execute("SET synchronous_commit = OFF")
+            cursor.execute("SET work_mem = '1GB'")
+            cursor.execute("SET maintenance_work_mem = '2GB'")
         except Exception as e:
-            logger.warning(f"优化配置失败: {e}")
+            pass  # 忽略配置失败
         
         total_inserted = 0
         completed_files = 0
@@ -280,9 +276,7 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
                                     conn = psycopg2.connect(**db_config)
                                     conn.autocommit = False
                                     cursor = conn.cursor()
-                                    # 重新设置优化参数
                                     cursor.execute("SET synchronous_commit = OFF")
-                                    cursor.execute("SET commit_delay = 200000")
                                     time.sleep(0.5)  # 短暂等待
                                 except Exception:
                                     pass

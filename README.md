@@ -118,39 +118,14 @@ type logs\progress\papers_progress.txt
 psql -U postgres -d s2orc_d1 -c "SELECT COUNT(*) FROM papers;"
 ```
 
-**Q: USB 外接硬盘导入速度慢（<5000条/秒）？**
+**Q: USB 外接硬盘导入速度慢？**
 
-USB 硬盘写入慢会导致插入速度只有 873条/秒，使用以下完整流程优化至 **30000-60000条/秒**（提速 35-70 倍）：
+代码已自动优化（超大批次 + 异步提交），无需手动配置。预期速度：10000-30000条/秒。
 
-```powershell
-# 1. 优化 PostgreSQL 配置
-python scripts/test/optimize_postgresql_for_usb.py `
-    --config "C:\PostgreSQL\data\postgresql.conf" `
-    --mode import
-
-# 2. 重启 PostgreSQL
-net stop postgresql-x64-13
-net start postgresql-x64-13
-
-# 3. 运行导入（速度提升至 30000-60000条/秒）
-python scripts/test/batch_process_machine_mapping_test.py `
-    --machine machine1 `
-    --base-dir "E:\machine_win01\2025-09-30"
-
-# 4. 导入完成后恢复安全配置
-python scripts/test/optimize_postgresql_for_usb.py `
-    --config "C:\PostgreSQL\data\postgresql.conf" `
-    --mode safe
-
-# 5. 重启 PostgreSQL
-net stop postgresql-x64-13
-net start postgresql-x64-13
-```
-
-⚠️ **重要**：
-- `fsync=off` 会在断电时丢失数据，**仅用于批量导入**
-- 导入完成后**必须执行步骤4和5**恢复安全配置
-- 配置文件路径通常为：`C:\Program Files\PostgreSQL\{version}\data\postgresql.conf`
+如果速度仍然很慢，检查：
+- USB 硬盘健康状态
+- 是否有其他程序占用磁盘 I/O
+- PostgreSQL 日志是否有错误
 
 ---
 
