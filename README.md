@@ -152,3 +152,64 @@ TABLESPACE_CONFIG = {
     'location': 'E:\\postgreSQL',  # ← 修改为其他盘符
 }
 ```
+
+---
+
+## 🧪 轻量级映射表导入（测试/验证专用）
+
+适用于需要快速验证或只需要 corpusid 映射的场景。
+
+### 特点
+
+- ⚡ **极速**：只提取 corpusid（无 JSONB 数据），速度快 10 倍以上
+- 💾 **轻量**：单表存储所有数据集的 corpusid
+- 🔒 **去重**：自动去除重复的 corpusid
+- 🎯 **无索引导入**：先插入后建主键，最大化速度
+
+### 使用流程
+
+```powershell
+# 步骤1：创建无主键表（极速导入模式）
+python scripts/test/init_mapping_table.py
+
+# 步骤2：批量导入数据
+python scripts/test/batch_process_machine_mapping_test.py `
+    --machine machine1 `
+    --base-dir "E:\machine_win01\2025-09-30"
+
+# 步骤3：导入完成后添加主键（一次性建索引+自动去重）
+python scripts/test/init_mapping_table.py --add-pk
+```
+
+### 单文件夹导入
+
+```powershell
+# 导入单个数据集
+python scripts/test/stream_gz_to_mapping_table.py `
+    --dir "E:\data\s2orc" `
+    --dataset s2orc `
+    --extractors 4
+```
+
+### 支持的数据集
+
+- `embeddings_specter_v1`
+- `embeddings_specter_v2`
+- `s2orc`
+- `s2orc_v2`
+
+### 输出表结构
+
+```sql
+-- 表名：corpus_filename_mapping
+CREATE TABLE corpus_filename_mapping (
+    corpusid BIGINT PRIMARY KEY  -- 唯一的 corpusid
+);
+```
+
+### 注意事项
+
+1. **Machine1/Machine2 专用**：只处理大数据集（embeddings 和 s2orc）
+2. **无断点续传冲突**：使用独立的进度目录 `logs/progress_mapping/`
+3. **内存友好**：Extractor 端自动去重，减少内存占用
+4. **与正式导入隔离**：不影响现有的数据库表和进度
