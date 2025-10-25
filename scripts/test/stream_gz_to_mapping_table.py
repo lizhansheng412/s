@@ -18,7 +18,7 @@ from io import StringIO, BufferedReader, TextIOWrapper
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from database.config.db_config_v2 import DB_CONFIG
+from database.config import get_db_config
 
 # 配置参数
 BATCH_SIZE = 1000000  # 100万条/批次（增大批次减少通信开销）
@@ -26,7 +26,7 @@ COMMIT_BATCHES = 3    # 每3批次提交（300万条/事务，平衡速度和安
 NUM_EXTRACTORS = 4
 QUEUE_SIZE = 30       # 减小队列，避免内存积压
 
-MAPPING_TABLE = 'corpus_filename_mapping'
+MAPPING_TABLE = 'corpus_bigdataset'
 SUPPORTED_TABLES = {'embeddings_specter_v1', 'embeddings_specter_v2', 's2orc', 's2orc_v2'}
 
 PROGRESS_DIR = 'logs/progress_mapping'
@@ -207,7 +207,9 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
     buffer_pool = StringIO()  # 复用 StringIO 对象，减少 GC 压力
     
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        # 始终连接本机数据库（machine1 的 5431 端口）
+        db_config = get_db_config('machine1')
+        conn = psycopg2.connect(**db_config)
         conn.autocommit = False
         cursor = conn.cursor()
         
@@ -269,7 +271,7 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
                                 cursor.close()
                             if conn:
                                 conn.close()
-                            conn = psycopg2.connect(**DB_CONFIG)
+                            conn = psycopg2.connect(**db_config)
                             conn.autocommit = False
                             cursor = conn.cursor()
                         except Exception:
@@ -449,7 +451,7 @@ def process_gz_folder_to_mapping(folder_path: str, dataset_type: str,
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='提取 corpusid 到映射表')
+    parser = argparse.ArgumentParser(description='提取 corpusid 到大数据集表（写入本机 Machine1 数据库）')
     parser.add_argument('--dir', type=str, required=True, help='GZ 文件夹路径')
     parser.add_argument('--dataset', type=str, required=True, choices=list(SUPPORTED_TABLES), help='数据集类型')
     parser.add_argument('--extractors', type=int, default=NUM_EXTRACTORS, help=f'解压进程数（默认: {NUM_EXTRACTORS}）')

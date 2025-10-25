@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 def batch_process_machine_mapping(machine_id: str, base_dir: str, 
                                   num_extractors: int = NUM_EXTRACTORS, 
                                   resume: bool = True):
-    """批量处理机器分配的文件夹"""
+    """批量处理硬盘上的文件夹（写入本机 Machine1 数据库）"""
     if machine_id not in ['machine1', 'machine2']:
         logger.error(f"❌ 只支持 machine1/machine2，当前: {machine_id}")
         sys.exit(1)
@@ -108,10 +108,11 @@ def batch_process_machine_mapping(machine_id: str, base_dir: str,
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='批量处理脚本（映射表模式）')
+    parser = argparse.ArgumentParser(description='批量处理脚本（写入本机 Machine1 数据库）')
     parser.add_argument('--machine', type=str, required=True, 
-                       choices=['machine1', 'machine2'], help='机器ID')
-    parser.add_argument('--base-dir', type=str, required=True, help='数据根目录')
+                       choices=['machine1', 'machine2'], 
+                       help='硬盘配置ID（machine1: embeddings_v1+s2orc, machine2: embeddings_v2+s2orc_v2）')
+    parser.add_argument('--base-dir', type=str, required=True, help='硬盘数据根目录')
     parser.add_argument('--extractors', type=int, default=NUM_EXTRACTORS, 
                        help=f'解压进程数（默认: {NUM_EXTRACTORS}）')
     parser.add_argument('--no-resume', action='store_true', help='禁用断点续传')

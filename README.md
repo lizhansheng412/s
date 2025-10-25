@@ -166,20 +166,33 @@ TABLESPACE_CONFIG = {
 - 🔒 **去重**：自动去除重复的 corpusid
 - 🎯 **无索引导入**：先插入后建主键，最大化速度
 
-### 使用流程
+### 使用流程（全部在 Machine1 上执行）
+
+**前提：** 硬盘1（数据库）和硬盘2（数据源）同时连接到 Machine1
 
 ```powershell
-# 步骤1：创建无主键表（极速导入模式）
+# 步骤1：在硬盘1上创建数据库表（极速导入模式，无主键）
 python scripts/test/init_mapping_table.py
 
-# 步骤2：批量导入数据
+# 步骤2：处理硬盘1数据 → 写入硬盘1数据库（embeddings_specter_v1 + s2orc）
 python scripts/test/batch_process_machine_mapping_test.py `
     --machine machine1 `
-    --base-dir "E:\machine_win01\2025-09-30"
+    --base-dir "E:\2025-09-30"
 
-# 步骤3：导入完成后添加主键（一次性建索引+自动去重）
+# 步骤3：处理硬盘2数据 → 写入硬盘1数据库（embeddings_specter_v2 + s2orc_v2）
+python scripts/test/batch_process_machine_mapping_test.py `
+    --machine machine2 `
+    --base-dir "F:\2025-09-30"
+
+# 步骤4：导入完成后添加主键（快速去重+一次性建索引）
 python scripts/test/init_mapping_table.py --add-pk
 ```
+
+**说明：**
+- 数据库位置：硬盘1（E盘）PostgreSQL 端口 5431
+- 硬盘1数据：E:\2025-09-30\（embeddings_specter_v1, s2orc）
+- 硬盘2数据：F:\2025-09-30\（embeddings_specter_v2, s2orc_v2）
+- 步骤2和3可以按任意顺序执行，甚至可以并行执行（如果性能允许）
 
 ### 单文件夹导入
 
@@ -201,15 +214,23 @@ python scripts/test/stream_gz_to_mapping_table.py `
 ### 输出表结构
 
 ```sql
--- 表名：corpus_filename_mapping
-CREATE TABLE corpus_filename_mapping (
-    corpusid BIGINT PRIMARY KEY  -- 唯一的 corpusid
+-- 表名：corpus_bigdataset
+CREATE TABLE corpus_bigdataset (
+    corpusid BIGINT PRIMARY KEY  -- 4个大数据集的唯一 corpusid 并集
 );
 ```
 
 ### 注意事项
 
-1. **Machine1/Machine2 专用**：只处理大数据集（embeddings 和 s2orc）
-2. **无断点续传冲突**：使用独立的进度目录 `logs/progress_mapping/`
-3. **内存友好**：Extractor 端自动去重，减少内存占用
-4. **与正式导入隔离**：不影响现有的数据库表和进度
+1. **所有操作在 Machine1 执行**：数据库存储在硬盘1（PostgreSQL 端口 5431）
+2. **硬盘配置**：
+   - 硬盘1（E盘）：数据库 + embeddings_v1 + s2orc
+   - 硬盘2（F盘）：embeddings_v2 + s2orc_v2
+   - 两个硬盘同时连接到 Machine1
+3. **--machine 参数**：指定使用哪个硬盘的文件夹配置，不是物理机器
+   - `machine1` → 硬盘1的文件夹（embeddings_specter_v1, s2orc）
+   - `machine2` → 硬盘2的文件夹（embeddings_specter_v2, s2orc_v2）
+4. **可以并行处理**：如果 I/O 和 CPU 允许，步骤2和3可以同时执行
+5. **断点续传**：使用独立的进度目录 `logs/progress_mapping/`
+6. **内存优化**：Extractor 端自动去重，减少内存占用
+7. **与正式导入隔离**：不影响现有的数据库表和进度

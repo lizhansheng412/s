@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-初始化映射表 corpus_filename_mapping
-只存储唯一的 corpusid（无主键，极速导入）
+初始化大数据集表 corpus_bigdataset
+存储4个大数据集的唯一 corpusid（无主键，极速导入）
 """
 
 import sys
@@ -11,20 +11,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import psycopg2
-from database.config.db_config_v2 import DB_CONFIG
+from database.config import get_db_config
 
 
 def create_mapping_table():
-    """创建映射表（无主键，极速导入模式）"""
+    """创建大数据集表（无主键，极速导入模式）"""
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        # 始终连接本机数据库（machine1 的 5431 端口）
+        db_config = get_db_config('machine1')
+        print(f"📡 连接到数据库: {db_config['database']}@{db_config['host']}:{db_config['port']}")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
                 WHERE table_schema = 'public' 
-                AND table_name = 'corpus_filename_mapping'
+                AND table_name = 'corpus_bigdataset'
             );
         """)
         
@@ -34,14 +37,14 @@ def create_mapping_table():
             if response != 'yes':
                 print("取消操作")
                 return
-            cursor.execute("DROP TABLE corpus_filename_mapping CASCADE;")
+            cursor.execute("DROP TABLE corpus_bigdataset CASCADE;")
             conn.commit()
             print("✅ 旧表已删除")
         
         # 创建表（无主键，极速导入）
-        print("创建映射表（无主键模式）...")
+        print("创建大数据集表（无主键模式）...")
         cursor.execute("""
-            CREATE TABLE corpus_filename_mapping (
+            CREATE TABLE corpus_bigdataset (
                 corpusid BIGINT NOT NULL
             ) WITH (
                 fillfactor = 100,
@@ -62,40 +65,71 @@ def create_mapping_table():
 
 
 def add_primary_key():
-    """导入完成后添加主键（一次性建索引）"""
+    """导入完成后添加主键（快速去重+建索引）"""
+    import time
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        # 始终连接本机数据库（machine1 的 5431 端口）
+        db_config = get_db_config('machine1')
+        print(f"📡 连接到数据库: {db_config['database']}@{db_config['host']}:{db_config['port']}")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
-        print("删除重复数据...")
-        cursor.execute("""
-            DELETE FROM corpus_filename_mapping a
-            USING corpus_filename_mapping b
-            WHERE a.ctid < b.ctid AND a.corpusid = b.corpusid;
-        """)
-        deleted = cursor.rowcount
-        print(f"✅ 删除 {deleted:,} 条重复记录")
+        # 统计原始数据
+        print("📊 统计原始数据...")
+        cursor.execute("SELECT COUNT(*) FROM corpus_bigdataset;")
+        original_count = cursor.fetchone()[0]
+        print(f"   原始记录: {original_count:,} 条")
         
-        print("添加主键（一次性建索引）...")
+        # 快速去重：创建新表 + SELECT DISTINCT（比 DELETE 快很多）
+        print("\n🚀 快速去重中（使用 SELECT DISTINCT）...")
+        start_time = time.time()
+        
         cursor.execute("""
-            ALTER TABLE corpus_filename_mapping 
-            ADD PRIMARY KEY (corpusid);
+            CREATE TABLE corpus_bigdataset_temp AS
+            SELECT DISTINCT corpusid 
+            FROM corpus_bigdataset;
         """)
         
-        print("启用自动清理...")
-        cursor.execute("""
-            ALTER TABLE corpus_filename_mapping 
-            SET (autovacuum_enabled = true);
-        """)
+        dedup_time = time.time() - start_time
+        print(f"✅ 去重完成（耗时: {dedup_time:.1f}秒）")
+        
+        # 统计去重后数据
+        cursor.execute("SELECT COUNT(*) FROM corpus_bigdataset_temp;")
+        unique_count = cursor.fetchone()[0]
+        deleted = original_count - unique_count
+        print(f"   去重后记录: {unique_count:,} 条")
+        print(f"   删除重复: {deleted:,} 条 ({deleted/original_count*100:.1f}%)")
+        
+        # 替换旧表
+        print("\n🔄 替换旧表...")
+        cursor.execute("DROP TABLE corpus_bigdataset;")
+        cursor.execute("ALTER TABLE corpus_bigdataset_temp RENAME TO corpus_bigdataset;")
+        print("✅ 表替换完成")
+        
+        # 添加主键（一次性建索引）
+        print("\n🔑 添加主键...")
+        start_time = time.time()
+        cursor.execute("ALTER TABLE corpus_bigdataset ADD PRIMARY KEY (corpusid);")
+        index_time = time.time() - start_time
+        print(f"✅ 主键添加完成（耗时: {index_time:.1f}秒）")
+        
+        # 启用自动清理
+        cursor.execute("ALTER TABLE corpus_bigdataset SET (autovacuum_enabled = true);")
+        
+        # 分析表（更新统计信息）
+        print("\n📈 更新统计信息...")
+        cursor.execute("ANALYZE corpus_bigdataset;")
         
         conn.commit()
         
-        # 统计
-        cursor.execute("SELECT COUNT(*) FROM corpus_filename_mapping;")
-        count = cursor.fetchone()[0]
-        
-        print(f"\n✅ 主键添加完成！")
-        print(f"📊 总记录数: {count:,}")
+        print(f"\n" + "="*60)
+        print(f"✅ 所有操作完成！")
+        print(f"="*60)
+        print(f"📊 最终统计:")
+        print(f"   - 唯一 corpusid: {unique_count:,} 条")
+        print(f"   - 去重率: {deleted/original_count*100:.1f}%")
+        print(f"   - 总耗时: {dedup_time + index_time:.1f}秒")
+        print(f"="*60)
         
         cursor.close()
         conn.close()
@@ -108,9 +142,9 @@ def add_primary_key():
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='初始化映射表')
+    parser = argparse.ArgumentParser(description='初始化大数据集表（操作本机 Machine1 数据库）')
     parser.add_argument('--add-pk', action='store_true', 
-                       help='导入完成后添加主键（一次性建索引）')
+                       help='导入完成后添加主键（一次性建索引+快速去重）')
     
     args = parser.parse_args()
     
