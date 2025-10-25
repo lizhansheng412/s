@@ -552,6 +552,14 @@ def inserter_worker(
         traceback.print_exc()
 
 
+def clean_utf8(text: str) -> str:
+    """清理字符串中的无效 UTF-8 字符"""
+    if not text:
+        return text
+    # 编码为 UTF-8，替换无效字符，再解码回来
+    return text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+
+
 def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = False, primary_key: str = 'corpusid') -> int:
     """
     使用COPY批量插入（最快方法）
@@ -638,7 +646,7 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
         # 以下是其他表的原有逻辑
         elif use_upsert:
             # UPSERT模式：批内去重 + 分批插入
-            seen = {key_value: data for key_value, data in batch}
+            seen = {key_value: clean_utf8(data) for key_value, data in batch}
             chunk_size = 1000
             total_processed = 0
             
@@ -671,7 +679,7 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
             # citations表：自增主键，直接插入citingcorpusid字段
             if table_name == 'citations':
                 buffer = StringIO()
-                buffer.write(''.join(f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch))
+                buffer.write(''.join(f"{key_val}\t{clean_utf8(data)}\t\\N\t\\N\n" for key_val, data in batch))
                 buffer.seek(0)
                 
                 cursor.copy_expert(
@@ -683,7 +691,7 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
             
             # 其他表：主键唯一，处理冲突
             buffer = StringIO()
-            buffer.write(''.join(f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in batch))
+            buffer.write(''.join(f"{key_val}\t{clean_utf8(data)}\t\\N\t\\N\n" for key_val, data in batch))
             buffer.seek(0)
             
             try:
@@ -715,7 +723,7 @@ def batch_insert_copy(cursor, table_name: str, batch: list, use_upsert: bool = F
                     return 0
                 
                 buffer = StringIO()
-                buffer.write(''.join(f"{key_val}\t{data}\t\\N\t\\N\n" for key_val, data in new_batch))
+                buffer.write(''.join(f"{key_val}\t{clean_utf8(data)}\t\\N\t\\N\n" for key_val, data in new_batch))
                 buffer.seek(0)
                 
                 try:

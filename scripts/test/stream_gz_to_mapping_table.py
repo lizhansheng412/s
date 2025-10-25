@@ -20,11 +20,11 @@ import psycopg2
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from database.config import get_db_config
 
-# 配置参数
-BATCH_SIZE = 1000000  # 100万条/批次（增大批次减少通信开销）
-COMMIT_BATCHES = 3    # 每3批次提交（300万条/事务，平衡速度和安全性）
+# 配置参数（USB硬盘优化：超大事务，极少commit）
+BATCH_SIZE = 1000000  # 100万条/批次（corpusid只有8字节）
+COMMIT_BATCHES = 20   # 每20批次提交（2000万条/事务，约160MB，减少USB硬盘写入次数）
 NUM_EXTRACTORS = 4
-QUEUE_SIZE = 30       # 减小队列，避免内存积压
+QUEUE_SIZE = 30
 
 MAPPING_TABLE = 'corpus_bigdataset'
 SUPPORTED_TABLES = {'embeddings_specter_v1', 'embeddings_specter_v2', 's2orc', 's2orc_v2'}
@@ -213,17 +213,17 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
         conn.autocommit = False
         cursor = conn.cursor()
         
-        # 数据库性能优化（激进但安全的配置）
+        # 数据库性能优化（会话级别）
         try:
-            cursor.execute("SET synchronous_commit = OFF")      # 异步提交（安全）
-            cursor.execute("SET commit_delay = 100000")         # 延迟提交（微秒）
-            cursor.execute("SET work_mem = '2GB'")              # 增大工作内存
-            cursor.execute("SET maintenance_work_mem = '4GB'")  # 增大维护内存
-            cursor.execute("SET wal_buffers = '64MB'")          # WAL 缓冲区
-            cursor.execute("SET checkpoint_timeout = '30min'")  # 降低检查点频率
-            cursor.execute("SET max_wal_size = '10GB'")         # 增大 WAL 大小
-        except Exception:
-            pass  # 部分参数可能需要超级用户权限
+            cursor.execute("SET synchronous_commit = OFF")  # 异步提交
+            cursor.execute("SET commit_delay = 200000")  # 200ms延迟提交
+            cursor.execute("SET work_mem = '2GB'")
+            cursor.execute("SET maintenance_work_mem = '4GB'")
+            cursor.execute("SET temp_buffers = '1GB'")
+            cursor.execute("SET effective_cache_size = '16GB'")
+            logger.info("✅ 会话优化已启用")
+        except Exception as e:
+            logger.warning(f"优化配置失败: {e}")
         
         total_inserted = 0
         completed_files = 0
@@ -243,40 +243,53 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
                 elif item_type == 'data':
                     _, file_name, batch = item
                     
-                    try:
-                        # 使用复用的 StringIO
-                        inserted = batch_insert_corpusids(cursor, batch, buffer_pool)
-                        batch_count += 1
+                    # 重试机制（最多3次）
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            # 使用复用的 StringIO
+                            inserted = batch_insert_corpusids(cursor, batch, buffer_pool)
+                            batch_count += 1
+                            
+                            # 超大事务提交策略（USB硬盘优化）
+                            if batch_count >= commit_batches:
+                                conn.commit()
+                                batch_count = 0
+                                
+                                # 批量写入进度（减少文件 I/O）
+                                if pending_done:
+                                    for fname in pending_done:
+                                        tracker.mark_completed(fname)
+                                    pending_done.clear()
+                            
+                            total_inserted += inserted
+                            break  # 成功，跳出重试循环
                         
-                        # 大事务提交策略（平衡速度和安全）
-                        if batch_count >= commit_batches:
-                            conn.commit()
+                        except psycopg2.DatabaseError as e:
+                            logger.warning(f"插入错误 (尝试 {attempt+1}/{max_retries}): {e}")
+                            conn.rollback()
                             batch_count = 0
                             
-                            # 批量写入进度（减少文件 I/O）
-                            if pending_done:
-                                for fname in pending_done:
-                                    tracker.mark_completed(fname)
-                                pending_done.clear()
-                        
-                        total_inserted += inserted
-                    
-                    except psycopg2.DatabaseError as e:
-                        logger.warning(f"插入错误: {e}, 正在恢复...")
-                        conn.rollback()
-                        batch_count = 0
-                        # 重连数据库
-                        try:
-                            if cursor:
-                                cursor.close()
-                            if conn:
-                                conn.close()
-                            conn = psycopg2.connect(**db_config)
-                            conn.autocommit = False
-                            cursor = conn.cursor()
-                        except Exception:
-                            pass
-                        continue
+                            if attempt < max_retries - 1:
+                                # 重连数据库
+                                try:
+                                    if cursor:
+                                        cursor.close()
+                                    if conn:
+                                        conn.close()
+                                    conn = psycopg2.connect(**db_config)
+                                    conn.autocommit = False
+                                    cursor = conn.cursor()
+                                    # 重新设置优化参数
+                                    cursor.execute("SET synchronous_commit = OFF")
+                                    cursor.execute("SET commit_delay = 200000")
+                                    time.sleep(0.5)  # 短暂等待
+                                except Exception:
+                                    pass
+                            else:
+                                # 最后一次也失败，记录并跳过
+                                logger.error(f"批次插入失败（已重试{max_retries}次），跳过")
+                                break
                     
                     # 定期输出进度（每2秒，更频繁的反馈）
                     current_time = time.time()
