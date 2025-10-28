@@ -223,10 +223,14 @@ def main():
   machine0: paper-ids
 
 示例：
+  # 正常导入
   python scripts/batch_process_machine.py --machine machine1 --base-dir "E:\\2025-09-30"
   python scripts/batch_process_machine.py --machine machine2 --base-dir "E:\\2025-09-30"
   python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\\2025-09-30"
   python scripts/batch_process_machine.py --machine machine0 --base-dir "E:\\2025-09-30"
+  
+  # 重试失败文件（使用 --retry 标志）
+  python scripts/batch_process_machine.py --machine machine3 --base-dir "D:\\lzs_download\\faild_file_downlaod" --retry
   
   # 自定义解压进程数
   python scripts/batch_process_machine.py --machine machine1 --base-dir "E:\\data" --extractors 12
@@ -244,6 +248,8 @@ def main():
                        help='禁用断点续传（从头开始）')
     parser.add_argument('--upsert', action='store_true',
                        help='使用UPSERT模式（处理重复数据）')
+    parser.add_argument('--retry', action='store_true',
+                       help='重试失败文件模式（不排除已失败的文件）')
     
     args = parser.parse_args()
     
@@ -257,7 +263,8 @@ def main():
         base_dir=args.base_dir,
         num_extractors=args.extractors,
         resume=not args.no_resume,
-        use_upsert=args.upsert
+        use_upsert=args.upsert,
+        is_retry=args.retry
     )
 
 

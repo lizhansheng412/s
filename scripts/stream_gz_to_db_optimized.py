@@ -778,7 +778,8 @@ def process_gz_folder_pipeline(
     
     # 加载已完成和失败的文件
     completed_files = tracker.load_completed() if resume else set()
-    failed_files = failed_logger.load_failed() if (resume and not retry_failed) else set()
+    # 重试模式下，不排除失败文件（允许重新处理）
+    failed_files = failed_logger.load_failed() if (resume and not retry_failed and not is_retry) else set()
     
     # 扫描GZ文件
     gz_files = sorted(folder.glob("*.gz"))

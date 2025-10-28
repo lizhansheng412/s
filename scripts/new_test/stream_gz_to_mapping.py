@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-大数据集映射表插入脚本 - 提取 corpusid 到 corpus_bigdataset 表
-使用独立日志文件夹避免与主脚本冲突：logs/mapping_progress/ 和 logs/mapping_failed/
+corpusid 到 gz 文件名映射脚本 - 极速 COPY 插入模式
+使用独立日志：logs/corpusid_mapping_progress/ 和 logs/corpusid_mapping_failed/
 """
 
 import gzip
@@ -23,16 +23,14 @@ from database.config import get_db_config
 # 性能参数
 BATCH_SIZE = 500000
 COMMIT_BATCHES = 6
-NUM_EXTRACTORS = 4  # 默认进程数（SSD/内置硬盘）
-NUM_EXTRACTORS_USB_HDD = 1  # USB机械硬盘推荐值（避免磁头寻道）
-QUEUE_SIZE = 30
+NUM_EXTRACTORS = 1  # 提取进程（USB硬盘瓶颈）
+NUM_INSERTERS = 4  # 插入进程（利用SSD性能）
+QUEUE_SIZE = 100  # 较大队列，缓冲速度差异
 
-MAPPING_TABLE = 'corpus_bigdataset'
-SUPPORTED_TABLES = {'embeddings_specter_v1', 'embeddings_specter_v2', 's2orc', 's2orc_v2'}
+TABLE_NAME = 'corpus_new_bigdataset'
 
-# 独立的日志目录，避免与主脚本冲突
-PROGRESS_DIR = 'logs/mapping_progress'
-FAILED_DIR = 'logs/mapping_failed'
+PROGRESS_DIR = 'logs/corpusid_mapping_progress'
+FAILED_DIR = 'logs/corpusid_mapping_failed'
 
 logging.basicConfig(level=logging.ERROR, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -94,15 +92,15 @@ class FailedFilesLogger:
             self.failed_file.unlink()
 
 
-def get_log_files(dataset_type: str):
+def get_log_files(field_name: str):
     """获取日志文件路径"""
     progress_dir = Path(PROGRESS_DIR)
     failed_dir = Path(FAILED_DIR)
     progress_dir.mkdir(parents=True, exist_ok=True)
     failed_dir.mkdir(parents=True, exist_ok=True)
     
-    progress_file = progress_dir / f"{dataset_type}_progress.txt"
-    failed_file = failed_dir / f"{dataset_type}_failed.txt"
+    progress_file = progress_dir / f"{field_name}_progress.txt"
+    failed_file = failed_dir / f"{field_name}_failed.txt"
     
     return str(progress_file), str(failed_file)
 
@@ -133,7 +131,8 @@ def fast_extract_corpusid(line: str) -> int:
         return None
 
 
-def extractor_worker(file_queue: Queue, data_queue: Queue, stats_dict: dict, batch_size: int = BATCH_SIZE):
+def extractor_worker(file_queue: Queue, data_queue: Queue, progress_queue: Queue,
+                    stats_dict: dict, field_name: str, batch_size: int = BATCH_SIZE):
     """生产者：解压并提取 corpusid"""
     import logging
     logging.getLogger().setLevel(logging.CRITICAL)
@@ -168,26 +167,26 @@ def extractor_worker(file_queue: Queue, data_queue: Queue, stats_dict: dict, bat
                             batch_set.add(corpusid)
                             
                             if len(batch_set) >= batch_size:
-                                data_queue.put(('data', file_name, list(batch_set)))
+                                data_queue.put(('data', field_name, file_name, list(batch_set)))
                                 batch_set.clear()
                     
                     if batch_set:
-                        data_queue.put(('data', file_name, list(batch_set)))
+                        data_queue.put(('data', field_name, file_name, list(batch_set)))
                     
-                    data_queue.put(('done', file_name, valid_count))
+                    progress_queue.put(('done', file_name, valid_count))
                     stats_dict['extracted'] = stats_dict.get('extracted', 0) + valid_count
                     
                 except (OSError, EOFError, ValueError, gzip.BadGzipFile):
-                    data_queue.put(('error', file_name, "Corrupted file"))
+                    progress_queue.put(('error', file_name, "Corrupted file"))
                     continue
                 except MemoryError:
                     import gc
                     gc.collect()
-                    data_queue.put(('error', file_name, "Memory error"))
+                    progress_queue.put(('error', file_name, "Memory error"))
                     continue
                 
             except Exception as e:
-                data_queue.put(('error', file_name, str(e)))
+                progress_queue.put(('error', file_name, str(e)))
         
         except Empty:
             continue
@@ -195,10 +194,9 @@ def extractor_worker(file_queue: Queue, data_queue: Queue, stats_dict: dict, bat
             break
 
 
-def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict, 
-                   tracker: ProgressTracker, failed_logger: FailedFilesLogger, 
-                   commit_batches: int = COMMIT_BATCHES, total_files: int = 0):
-    """消费者：批量插入 corpusid"""
+def inserter_worker(worker_id: int, data_queue: Queue, stats_dict: dict, 
+                   commit_batches: int = COMMIT_BATCHES):
+    """消费者：批量COPY插入"""
     conn = None
     cursor = None
     buffer_pool = StringIO()
@@ -212,16 +210,11 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
         try:
             cursor.execute("SET synchronous_commit = OFF")
             cursor.execute("SET work_mem = '1GB'")
-            cursor.execute("SET maintenance_work_mem = '2GB'")
         except Exception:
             pass
         
         total_inserted = 0
-        completed_files = 0
-        last_log_time = time.time()
-        start_time = time.time()
         batch_count = 0
-        pending_done = []
         
         while True:
             try:
@@ -232,25 +225,21 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
                     break
                 
                 elif item_type == 'data':
-                    _, file_name, batch = item
+                    _, field_name, gz_filename, corpusids = item
                     
                     try:
-                        inserted = batch_insert_corpusids(cursor, batch, buffer_pool)
+                        inserted = batch_copy_insert(cursor, field_name, gz_filename, 
+                                                     corpusids, buffer_pool)
                         batch_count += 1
                         
                         if batch_count >= commit_batches:
                             conn.commit()
                             batch_count = 0
-                            
-                            if pending_done:
-                                for fname in pending_done:
-                                    tracker.mark_completed(fname)
-                                pending_done.clear()
                         
                         total_inserted += inserted
                     
                     except psycopg2.DatabaseError as e:
-                        logger.warning(f"插入错误: {e}")
+                        logger.warning(f"[Inserter-{worker_id}] 插入错误: {e}")
                         conn.rollback()
                         batch_count = 0
                         try:
@@ -264,31 +253,11 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
                             cursor.execute("SET synchronous_commit = OFF")
                         except Exception:
                             pass
-                    
-                    current_time = time.time()
-                    if current_time - last_log_time >= 2:
-                        elapsed = current_time - start_time
-                        rate = total_inserted / elapsed if elapsed > 0 else 0
-                        progress_pct = (completed_files / total_files * 100) if total_files > 0 else 0
-                        
-                        print(f"\r📊 [{completed_files}/{total_files}] {progress_pct:.1f}% | "
-                              f"{total_inserted:,}条 | {rate:,.0f}条/秒    ", end='', flush=True)
-                        last_log_time = current_time
-                
-                elif item_type == 'done':
-                    _, file_name, _ = item
-                    pending_done.append(file_name)
-                    completed_files += 1
-                
-                elif item_type == 'error':
-                    _, file_name, error = item
-                    failed_logger.log_failed(file_name, error)
-                    completed_files += 1
             
             except Empty:
                 continue
             except Exception as e:
-                logger.error(f"队列错误: {e}")
+                logger.error(f"[Inserter-{worker_id}] 错误: {e}")
                 if conn:
                     conn.rollback()
                 continue
@@ -296,14 +265,10 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
         if batch_count > 0:
             conn.commit()
         
-        if pending_done:
-            for fname in pending_done:
-                tracker.mark_completed(fname)
-        
-        stats_dict['inserted'] = total_inserted
+        stats_dict[f'inserted_{worker_id}'] = total_inserted
         
     except Exception as e:
-        logger.error(f"插入进程错误: {e}")
+        logger.error(f"[Inserter-{worker_id}] 进程错误: {e}")
     finally:
         if cursor:
             cursor.close()
@@ -311,9 +276,10 @@ def inserter_worker(data_queue: Queue, dataset_type: str, stats_dict: dict,
             conn.close()
 
 
-def batch_insert_corpusids(cursor, batch: list, buffer: StringIO = None) -> int:
-    """批量插入 corpusid（COPY 方式）"""
-    if not batch:
+def batch_copy_insert(cursor, field_name: str, gz_filename: str, 
+                     corpusids: list, buffer: StringIO = None) -> int:
+    """批量COPY插入（极速模式）"""
+    if not corpusids:
         return 0
     
     try:
@@ -323,41 +289,37 @@ def batch_insert_corpusids(cursor, batch: list, buffer: StringIO = None) -> int:
             buffer.seek(0)
             buffer.truncate(0)
         
-        for cid in batch:
+        # 构造 TSV 数据：corpusid \t gz_filename
+        for cid in corpusids:
             buffer.write(str(cid))
+            buffer.write('\t')
+            buffer.write(gz_filename)
             buffer.write('\n')
         
         buffer.seek(0)
         
+        # COPY 插入（只插入 corpusid 和对应字段）
         cursor.copy_expert(
-            f"COPY {MAPPING_TABLE} (corpusid) FROM STDIN",
+            f"COPY {TABLE_NAME} (corpusid, {field_name}) FROM STDIN",
             buffer
         )
-        return len(batch)
+        return len(corpusids)
     
     except Exception as e:
-        logger.error(f"插入失败: {e}")
+        logger.error(f"批量插入失败: {e}")
         raise
 
 
-def process_gz_folder_to_mapping(folder_path: str, dataset_type: str, 
+def process_gz_folder_to_mapping(folder_path: str, field_name: str, 
                                  num_extractors: int = NUM_EXTRACTORS,
-                                 resume: bool = True, reset_progress: bool = False,
-                                 usb_mode: bool = False):
-    """处理 GZ 文件夹，提取 corpusid"""
-    if dataset_type not in SUPPORTED_TABLES:
-        raise ValueError(f"不支持的数据集: {dataset_type}")
-    
+                                 num_inserters: int = NUM_INSERTERS,
+                                 resume: bool = True, reset_progress: bool = False):
+    """处理 GZ 文件夹，映射 corpusid 到 gz 文件名"""
     folder = Path(folder_path)
     if not folder.exists():
         raise ValueError(f"文件夹不存在: {folder_path}")
     
-    # USB 硬盘模式优化
-    if usb_mode and num_extractors > NUM_EXTRACTORS_USB_HDD:
-        num_extractors = NUM_EXTRACTORS_USB_HDD
-        logger.info(f"⚠️  USB 硬盘模式：降低并发数至 {num_extractors} 以避免磁头寻道")
-    
-    progress_file, failed_file = get_log_files(dataset_type)
+    progress_file, failed_file = get_log_files(field_name)
     tracker = ProgressTracker(progress_file)
     failed_logger = FailedFilesLogger(failed_file)
     
@@ -376,8 +338,8 @@ def process_gz_folder_to_mapping(folder_path: str, dataset_type: str,
     excluded_files = completed_files | failed_files
     pending_files = [(str(f), f.name) for f in gz_files if f.name not in excluded_files]
     
-    mode_info = "USB模式" if usb_mode else f"{num_extractors}进程"
-    logger.info(f"\n▶ [{dataset_type}] {mode_info} | 总计: {len(gz_files)}, 已完成: {len(completed_files)}, 待处理: {len(pending_files)}")
+    logger.info(f"\n▶ [{field_name}] 提取:{num_extractors}进程 插入:{num_inserters}进程")
+    logger.info(f"   总计:{len(gz_files)} 已完成:{len(completed_files)} 待处理:{len(pending_files)}")
     
     if not pending_files:
         logger.info("✅ 所有文件已处理完成\n")
@@ -388,6 +350,7 @@ def process_gz_folder_to_mapping(folder_path: str, dataset_type: str,
     try:
         file_queue = Queue()
         data_queue = Queue(maxsize=QUEUE_SIZE)
+        progress_queue = Queue()
         
         manager = Manager()
         stats_dict = manager.dict()
@@ -398,34 +361,76 @@ def process_gz_folder_to_mapping(folder_path: str, dataset_type: str,
         for _ in range(num_extractors):
             file_queue.put(None)
         
-        inserter = Process(
-            target=inserter_worker,
-            args=(data_queue, dataset_type, stats_dict, tracker, failed_logger, COMMIT_BATCHES, len(pending_files)),
-            name='Inserter'
-        )
-        inserter.start()
+        # 启动多个插入进程
+        inserters = []
+        for i in range(num_inserters):
+            p = Process(
+                target=inserter_worker,
+                args=(i+1, data_queue, stats_dict, COMMIT_BATCHES),
+                name=f'Inserter-{i+1}'
+            )
+            p.start()
+            inserters.append(p)
         
+        # 启动提取进程
         extractors = []
         for i in range(num_extractors):
             p = Process(
                 target=extractor_worker,
-                args=(file_queue, data_queue, stats_dict, BATCH_SIZE),
+                args=(file_queue, data_queue, progress_queue, stats_dict, field_name, BATCH_SIZE),
                 name=f'Extractor-{i+1}'
             )
             p.start()
             extractors.append(p)
         
+        # 监控进度
+        completed_count = 0
+        failed_count = 0
+        last_log_time = time.time()
+        
+        while completed_count + failed_count < len(pending_files):
+            try:
+                item = progress_queue.get(timeout=2)
+                item_type = item[0]
+                
+                if item_type == 'done':
+                    _, file_name, _ = item
+                    tracker.mark_completed(file_name)
+                    completed_count += 1
+                
+                elif item_type == 'error':
+                    _, file_name, error = item
+                    failed_logger.log_failed(file_name, error)
+                    failed_count += 1
+                
+                # 定期输出进度
+                current_time = time.time()
+                if current_time - last_log_time >= 3:
+                    progress_pct = ((completed_count + failed_count) / len(pending_files) * 100) if pending_files else 0
+                    print(f"\r📊 进度: {completed_count + failed_count}/{len(pending_files)} ({progress_pct:.1f}%)    ", 
+                          end='', flush=True)
+                    last_log_time = current_time
+            
+            except Empty:
+                continue
+        
+        # 等待提取进程完成
         for p in extractors:
             p.join()
         
-        data_queue.put(('stop', None, None))
-        inserter.join()
+        # 停止插入进程
+        for _ in range(num_inserters):
+            data_queue.put(('stop', None, None, None))
+        
+        for p in inserters:
+            p.join()
         
         elapsed = time.time() - overall_start
-        total_inserted = stats_dict.get('inserted', 0)
+        total_inserted = sum(stats_dict.get(f'inserted_{i}', 0) for i in range(1, num_inserters+1))
         avg_rate = total_inserted / elapsed if elapsed > 0 else 0
         
-        logger.info(f"\n✅ [{dataset_type}] 完成: {len(pending_files)}文件, {total_inserted:,}条, {elapsed/60:.1f}分钟, {avg_rate:.0f}条/秒\n")
+        logger.info(f"\n✅ [{field_name}] 完成: {completed_count}文件, {total_inserted:,}条, "
+                   f"{elapsed/60:.1f}分钟, {avg_rate:.0f}条/秒\n")
         
     except KeyboardInterrupt:
         logger.warning("\n⚠️  用户中断")
@@ -438,26 +443,29 @@ def process_gz_folder_to_mapping(folder_path: str, dataset_type: str,
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='提取 corpusid 到 corpus_bigdataset 表')
+    parser = argparse.ArgumentParser(description='提取 corpusid 并映射到 gz 文件名')
     parser.add_argument('--dir', type=str, required=True, help='GZ 文件夹路径')
-    parser.add_argument('--dataset', type=str, required=True, choices=list(SUPPORTED_TABLES), help='数据集类型')
-    parser.add_argument('--extractors', type=int, default=NUM_EXTRACTORS, help=f'解压进程数（默认: {NUM_EXTRACTORS}）')
+    parser.add_argument('--field', type=str, required=True, help='表字段名')
+    parser.add_argument('--extractors', type=int, default=NUM_EXTRACTORS, 
+                       help=f'提取进程数（默认: {NUM_EXTRACTORS}）')
+    parser.add_argument('--inserters', type=int, default=NUM_INSERTERS, 
+                       help=f'插入进程数（默认: {NUM_INSERTERS}）')
     parser.add_argument('--resume', action='store_true', help='启用断点续传')
     parser.add_argument('--reset', action='store_true', help='重置进度')
-    parser.add_argument('--usb-mode', action='store_true', help='USB 硬盘模式（单进程顺序读取，避免磁头寻道）')
     parser.set_defaults(resume=True)
     
     args = parser.parse_args()
     
     process_gz_folder_to_mapping(
         folder_path=args.dir,
-        dataset_type=args.dataset,
+        field_name=args.field,
         num_extractors=args.extractors,
+        num_inserters=args.inserters,
         resume=args.resume,
-        reset_progress=args.reset,
-        usb_mode=args.usb_mode
+        reset_progress=args.reset
     )
 
 
 if __name__ == '__main__':
     main()
+

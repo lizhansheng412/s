@@ -60,6 +60,28 @@ python scripts/batch_process_machine.py --machine machine3 --base-dir "E:\2025-0
 
 ---
 
+## 🔁 失败文件重试
+
+### 自动重试（推荐）
+
+脚本在完成正常导入后，会自动检测 `D:\lzs_download\faild_file_downlaod` 目录，如果有失败文件会自动重试。
+
+### 手动重试
+
+如果需要手动重试失败文件，使用 `--retry` 标志：
+
+```powershell
+python scripts/batch_process_machine.py --machine machine3 --base-dir "D:\lzs_download\faild_file_downlaod" --retry
+```
+
+### 失败文件处理逻辑
+
+- **首次失败**: 记录到 `logs/failed/*_failed.txt`
+- **重试成功**: 从 `logs/failed/*_failed.txt` 中删除
+- **重试仍失败**: 移动到 `logs/always_failed/*_failed.txt`（永久失败）
+
+---
+
 ## ⚙️ 高级操作
 
 ### 单表操作

@@ -20,8 +20,7 @@ ENV/
 
 # 日志文件
 *.log
-logs/failed/
-logs/progress/
+logs/
 
 # 数据文件
 *.gz

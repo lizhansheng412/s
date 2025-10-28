@@ -121,7 +121,7 @@ def remove_indexes(table_name: str):
 
 
 def restore_indexes(table_name: str):
-    """恢复表的所有索引（去重+添加主键+额外索引）"""
+    """恢复表的所有索引（智能去重+添加主键+额外索引）"""
     if table_name not in FIELD_TABLES:
         logger.error(f"无效的表名: {table_name}")
         logger.info(f"支持的表: {', '.join(FIELD_TABLES)}")
@@ -133,66 +133,113 @@ def restore_indexes(table_name: str):
         cursor = conn.cursor()
         
         logger.info("="*80)
-        logger.info(f"恢复 {table_name} 表的所有索引（去重并建立索引）")
+        logger.info(f"恢复 {table_name} 表的所有索引（智能去重并建立索引）")
         logger.info("="*80)
-        
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-        before_count = cursor.fetchone()[0]
-        logger.info(f"去重前记录数: {before_count:,}")
         
         config = get_table_config(table_name)
         pk_column = config['primary_key']
         
-        logger.info(f"\n步骤 1/3: 删除重复记录（基于 {pk_column}）...")
+        # 检查主键是否已存在
+        cursor.execute("""
+            SELECT constraint_name 
+            FROM information_schema.table_constraints 
+            WHERE table_name = %s AND constraint_type = 'PRIMARY KEY'
+        """, (table_name,))
+        pk_exists = cursor.fetchone()
+        
+        if pk_exists:
+            logger.info(f"\n✓ 表已有主键约束: {pk_exists[0]}")
+            logger.info(f"  主键字段: {pk_column}")
+            logger.info(f"  跳过索引恢复操作（表已完成处理）")
+            
+            # 更新统计信息
+            logger.info(f"\n更新表统计信息...")
+            cursor.execute(f"ANALYZE {table_name}")
+            logger.info(f"  ✓ 完成")
+            
+            logger.info("\n" + "="*80)
+            logger.info("表已完成处理！")
+            logger.info("="*80)
+            return
+        
+        logger.info(f"\n策略: 直接尝试添加主键（快速失败模式）")
+        logger.info(f"  如果成功 → 无重复，完成")
+        logger.info(f"  如果失败 → 有重复，执行去重\n")
+        
+        logger.info(f"步骤 1/3: 尝试添加主键 ({pk_column})...")
         start_time = time.time()
         
-        cursor.execute(f"""
-            DELETE FROM {table_name} a USING (
-                SELECT MIN(ctid) as ctid, {pk_column}
-                FROM {table_name} 
-                GROUP BY {pk_column} HAVING COUNT(*) > 1
-            ) b
-            WHERE a.{pk_column} = b.{pk_column} 
-            AND a.ctid <> b.ctid
-        """)
-        
-        elapsed = time.time() - start_time
-        
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-        after_count = cursor.fetchone()[0]
-        duplicates = before_count - after_count
-        
-        logger.info(f"  ✓ 去重完成")
-        logger.info(f"    删除重复: {duplicates:,}")
-        logger.info(f"    保留唯一: {after_count:,}")
-        logger.info(f"    耗时: {elapsed:.2f} 秒")
-        
-        logger.info(f"\n步骤 2/3: 添加主键约束 ({pk_column})...")
-        start_time = time.time()
-        
-        cursor.execute(f"ALTER TABLE {table_name} ADD PRIMARY KEY ({pk_column})")
-        
-        elapsed = time.time() - start_time
-        logger.info(f"  ✓ 主键添加完成，耗时: {elapsed:.2f} 秒")
-        
-        if config['indexes']:
-            logger.info(f"\n步骤 3/3: 恢复额外索引...")
-            for idx_name in config['indexes']:
-                start_time = time.time()
-                
-                if table_name == 'citations' and idx_name == 'idx_citations_citingcorpusid':
-                    cursor.execute(f"""
-                        CREATE INDEX IF NOT EXISTS {idx_name} 
-                        ON {table_name}(citingcorpusid)
-                    """)
-                    elapsed = time.time() - start_time
-                    logger.info(f"  ✓ 索引 {idx_name} 创建完成，耗时: {elapsed:.2f} 秒")
-        else:
-            logger.info(f"\n步骤 3/3: 无需创建额外索引")
-        
-        logger.info(f"\n更新表统计信息...")
-        cursor.execute(f"ANALYZE {table_name}")
-        logger.info(f"  ✓ 统计信息更新完成")
+        try:
+            cursor.execute(f"ALTER TABLE {table_name} ADD PRIMARY KEY ({pk_column})")
+            elapsed = time.time() - start_time
+            
+            logger.info(f"  ✓ 主键添加成功！数据无重复")
+            logger.info(f"    耗时: {elapsed:.2f} 秒")
+            
+            # 恢复额外索引（如果有）
+            if config['indexes']:
+                logger.info(f"\n步骤 2/3: 恢复额外索引...")
+                for idx_name in config['indexes']:
+                    idx_start = time.time()
+                    if table_name == 'citations' and idx_name == 'idx_citations_citingcorpusid':
+                        cursor.execute(f"""
+                            CREATE INDEX IF NOT EXISTS {idx_name} 
+                            ON {table_name}(citingcorpusid)
+                        """)
+                        idx_elapsed = time.time() - idx_start
+                        logger.info(f"  ✓ 索引 {idx_name} 创建完成，耗时: {idx_elapsed:.2f} 秒")
+            else:
+                logger.info(f"\n步骤 2/3: 无需创建额外索引")
+            
+            logger.info(f"\n步骤 3/3: 更新统计信息...")
+            cursor.execute(f"ANALYZE {table_name}")
+            logger.info(f"  ✓ 完成")
+            
+        except psycopg2.errors.UniqueViolation:
+            elapsed = time.time() - start_time
+            conn.rollback()
+            
+            logger.info(f"  ✗ 检测到重复数据（耗时 {elapsed:.2f} 秒）")
+            logger.info(f"\n步骤 2/3: 去重并添加主键...")
+            start_time = time.time()
+            
+            temp_table = f"{table_name}_temp_dedup"
+            
+            logger.info(f"  1. 创建去重临时表: {temp_table}")
+            cursor.execute(f"""
+                CREATE TABLE {temp_table} AS 
+                SELECT DISTINCT ON ({pk_column}) *
+                FROM {table_name}
+                ORDER BY {pk_column}
+            """)
+            
+            logger.info(f"  2. 删除原表")
+            cursor.execute(f"DROP TABLE {table_name}")
+            
+            logger.info(f"  3. 重命名临时表")
+            cursor.execute(f"ALTER TABLE {temp_table} RENAME TO {table_name}")
+            
+            logger.info(f"  4. 添加主键")
+            cursor.execute(f"ALTER TABLE {table_name} ADD PRIMARY KEY ({pk_column})")
+            
+            elapsed = time.time() - start_time
+            logger.info(f"  ✓ 去重完成，耗时: {elapsed:.2f} 秒")
+            
+            # 恢复额外索引（如果有）
+            if config['indexes']:
+                logger.info(f"\n步骤 3/3: 恢复额外索引...")
+                for idx_name in config['indexes']:
+                    idx_start = time.time()
+                    if table_name == 'citations' and idx_name == 'idx_citations_citingcorpusid':
+                        cursor.execute(f"""
+                            CREATE INDEX IF NOT EXISTS {idx_name} 
+                            ON {table_name}(citingcorpusid)
+                        """)
+                        idx_elapsed = time.time() - idx_start
+                        logger.info(f"  ✓ 索引 {idx_name} 创建完成，耗时: {idx_elapsed:.2f} 秒")
+            
+            cursor.execute(f"ANALYZE {table_name}")
+            logger.info(f"  ✓ 统计信息更新完成")
         
         logger.info("\n" + "="*80)
         logger.info("索引恢复完成！")
@@ -273,6 +320,10 @@ def main():
                       choices=['machine1', 'machine2', 'machine3', 'machine0'],
                       help='机器ID（处理该机器的所有表）')
     
+    parser.add_argument('--db-machine', type=str,
+                       choices=['machine1', 'machine2', 'machine3', 'machine0'],
+                       help='指定数据库（用于单表/多表操作时指定数据库连接）')
+    
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--remove-indexes', action='store_true',
                        help='移除索引（开始导入前）')
@@ -281,12 +332,9 @@ def main():
     
     args = parser.parse_args()
     
-    if args.table:
-        tables = [args.table]
-    elif args.tables:
-        tables = args.tables
-    elif args.machine:
-        # 根据机器ID更新数据库配置
+    # 处理数据库配置
+    if args.machine:
+        # 使用 --machine 时，自动设置数据库
         db_config = get_db_config(args.machine)
         db_config_v2.DB_CONFIG.update(db_config)
         
@@ -297,6 +345,18 @@ def main():
         logger.info(f"数据库: {db_config_v2.DB_CONFIG['database']}")
         logger.info(f"描述: {config['description']}")
         logger.info(f"包含表: {', '.join(tables)}\n")
+    else:
+        # 单表或多表操作
+        if args.db_machine:
+            # 如果指定了 --db-machine，更新数据库配置
+            db_config = get_db_config(args.db_machine)
+            db_config_v2.DB_CONFIG.update(db_config)
+            logger.info(f"数据库: {db_config_v2.DB_CONFIG['database']} (机器: {args.db_machine})\n")
+        
+        if args.table:
+            tables = [args.table]
+        elif args.tables:
+            tables = args.tables
     
     if args.remove_indexes:
         if len(tables) == 1:
