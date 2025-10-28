@@ -21,7 +21,7 @@ ENV/
 # 日志文件
 *.log
 logs/
-scripts/merge/failed_corposid.txt
+scripts/merge/failed_corposid
 
 # 数据文件
 *.gz

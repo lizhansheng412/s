@@ -4,17 +4,17 @@
 硬盘配置管理 - 映射硬盘ID到文件夹和字段
 """
 
-# 硬盘配置字典
+# 硬盘配置字典（处理顺序：先 s2orc，后 embeddings）
 DISK_CONFIGS = {
     'm1': {
-        'description': 'Machine1 硬盘 - embeddings_v1 + s2orc',
-        'folders': ['embeddings-specter_v1', 's2orc'],
-        'fields': ['embeddings_specter_v1', 's2orc']
+        'description': 'Machine1 硬盘 - s2orc + embeddings_v1',
+        'folders': ['s2orc', 'embeddings-specter_v1'],
+        'fields': ['s2orc', 'embeddings_specter_v1']
     },
     'm2': {
-        'description': 'Machine2 硬盘 - embeddings_v2 + s2orc_v2',
-        'folders': ['embeddings-specter_v2', 's2orc_v2'],
-        'fields': ['embeddings_specter_v2', 's2orc_v2']
+        'description': 'Machine2 硬盘 - s2orc_v2 + embeddings_v2',
+        'folders': ['s2orc_v2', 'embeddings-specter_v2'],
+        'fields': ['s2orc_v2', 'embeddings_specter_v2']
     },
     'm3': {
         'description': 'Machine3 硬盘 - citations',

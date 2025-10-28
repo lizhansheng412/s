@@ -387,6 +387,13 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         completed_count = 0
         failed_count = 0
         last_log_time = time.time()
+        start_time = time.time()
+        
+        # 显示开始信息
+        from datetime import datetime
+        start_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n⏰ 开始时间: {start_datetime}")
+        print(f"📊 总文件数: {len(pending_files)}\n")
         
         while completed_count + failed_count < len(pending_files):
             try:
@@ -403,11 +410,34 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
                     failed_logger.log_failed(file_name, error)
                     failed_count += 1
                 
-                # 定期输出进度
+                # 实时更新进度（每秒）
                 current_time = time.time()
-                if current_time - last_log_time >= 3:
-                    progress_pct = ((completed_count + failed_count) / len(pending_files) * 100) if pending_files else 0
-                    print(f"\r📊 进度: {completed_count + failed_count}/{len(pending_files)} ({progress_pct:.1f}%)    ", 
+                if current_time - last_log_time >= 1:
+                    elapsed = current_time - start_time
+                    processed = completed_count + failed_count
+                    progress_pct = (processed / len(pending_files) * 100) if pending_files else 0
+                    
+                    # 预估剩余时间
+                    if processed > 0:
+                        avg_time_per_file = elapsed / processed
+                        remaining_files = len(pending_files) - processed
+                        eta_seconds = avg_time_per_file * remaining_files
+                        eta_hours = int(eta_seconds // 3600)
+                        eta_minutes = int((eta_seconds % 3600) // 60)
+                        eta_secs = int(eta_seconds % 60)
+                        eta_str = f"{eta_hours:02d}:{eta_minutes:02d}:{eta_secs:02d}"
+                    else:
+                        eta_str = "--:--:--"
+                    
+                    # 格式化已用时间
+                    elapsed_hours = int(elapsed // 3600)
+                    elapsed_minutes = int((elapsed % 3600) // 60)
+                    elapsed_secs = int(elapsed % 60)
+                    elapsed_str = f"{elapsed_hours:02d}:{elapsed_minutes:02d}:{elapsed_secs:02d}"
+                    
+                    print(f"\r📊 进度:{processed}/{len(pending_files)} ({progress_pct:.1f}%) | "
+                          f"✅成功:{completed_count} ❌失败:{failed_count} | "
+                          f"⏱️已用:{elapsed_str} 预计剩余:{eta_str}    ", 
                           end='', flush=True)
                     last_log_time = current_time
             
@@ -429,8 +459,29 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         total_inserted = sum(stats_dict.get(f'inserted_{i}', 0) for i in range(1, num_inserters+1))
         avg_rate = total_inserted / elapsed if elapsed > 0 else 0
         
-        logger.info(f"\n✅ [{field_name}] 完成: {completed_count}文件, {total_inserted:,}条, "
-                   f"{elapsed/60:.1f}分钟, {avg_rate:.0f}条/秒\n")
+        # 格式化总耗时
+        total_hours = int(elapsed // 3600)
+        total_minutes = int((elapsed % 3600) // 60)
+        total_secs = int(elapsed % 60)
+        
+        from datetime import datetime
+        end_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        print("\n")
+        logger.info(f"{'='*70}")
+        logger.info(f"✅ [{field_name}] 处理完成")
+        logger.info(f"{'='*70}")
+        logger.info(f"⏰ 结束时间: {end_datetime}")
+        logger.info(f"📊 处理统计:")
+        logger.info(f"   - 成功文件: {completed_count:,}")
+        logger.info(f"   - 失败文件: {failed_count:,}")
+        logger.info(f"   - 插入记录: {total_inserted:,} 条")
+        logger.info(f"⏱️  性能统计:")
+        logger.info(f"   - 总耗时: {total_hours:02d}:{total_minutes:02d}:{total_secs:02d}")
+        logger.info(f"   - 插入速度: {avg_rate:,.0f} 条/秒")
+        if completed_count > 0:
+            logger.info(f"   - 平均每文件: {elapsed/completed_count:.1f} 秒")
+        logger.info(f"{'='*70}\n")
         
     except KeyboardInterrupt:
         logger.warning("\n⚠️  用户中断")
@@ -450,9 +501,8 @@ def main():
                        help=f'提取进程数（默认: {NUM_EXTRACTORS}）')
     parser.add_argument('--inserters', type=int, default=NUM_INSERTERS, 
                        help=f'插入进程数（默认: {NUM_INSERTERS}）')
-    parser.add_argument('--resume', action='store_true', help='启用断点续传')
-    parser.add_argument('--reset', action='store_true', help='重置进度')
-    parser.set_defaults(resume=True)
+    parser.add_argument('--no-resume', action='store_true', help='禁用断点续传（默认启用）')
+    parser.add_argument('--reset', action='store_true', help='重置进度（清空已完成记录）')
     
     args = parser.parse_args()
     
@@ -461,7 +511,7 @@ def main():
         field_name=args.field,
         num_extractors=args.extractors,
         num_inserters=args.inserters,
-        resume=args.resume,
+        resume=not args.no_resume,  # 默认启用断点续传
         reset_progress=args.reset
     )
 
