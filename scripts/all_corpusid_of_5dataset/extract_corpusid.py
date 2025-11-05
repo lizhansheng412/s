@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-corpusid 到 gz 文件名映射脚本 - 极速 COPY 插入模式
-使用独立日志：logs/corpusid_mapping_progress/ 和 logs/corpusid_mapping_failed/
+提取所有 gz 文件中的 corpusid 并插入到 final_delivery 表
+极速 COPY 插入模式，支持断点续传
 """
 
 import gzip
@@ -18,19 +18,26 @@ from io import StringIO, BufferedReader, TextIOWrapper
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from database.config import get_db_config
+import db_config
 
-# 性能参数
-BATCH_SIZE = 500000
-COMMIT_BATCHES = 6
-NUM_EXTRACTORS = 1  # 提取进程（USB硬盘瓶颈）
-NUM_INSERTERS = 4  # 插入进程（利用SSD性能）
-QUEUE_SIZE = 100  # 较大队列，缓冲速度差异
+# 性能参数（数据库写入优化 - 小批次快速提交）
+BATCH_SIZE = 1000000         # 20万条/批（小批次，避免单次COPY过慢）
+COMMIT_BATCHES = 1        # 每3批提交（5万条/事务，快速释放锁）
+NUM_EXTRACTORS = 1         # 提取进程（USB硬盘瓶颈，必须为1避免随机访问）
+NUM_INSERTERS = 1          # 3个插入进程（平衡并行和锁竞争，可用--inserters调整）
+QUEUE_SIZE = 80            # 小队列（快速流转，避免内存堆积）
 
-TABLE_NAME = 'corpus_new_bigdataset'
+# USB硬盘优化
+USB_BUFFER_SIZE = 512 * 1024 * 1024  # 512MB缓冲（减少内存占用）
+SORT_BY_SIZE = True                  # 按文件大小排序
+SMALL_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB阈值（快速读取中小文件）
+SKIP_BATCH_DEDUP = True              # 跳过批内去重（数据库层面去重更快）
 
-PROGRESS_DIR = 'logs/corpusid_mapping_progress'
-FAILED_DIR = 'logs/corpusid_mapping_failed'
+TABLE_NAME = 'final_delivery'
+
+# 日志目录
+PROGRESS_DIR = 'logs/final_delivery_progress'
+FAILED_DIR = 'logs/final_delivery_failed'
 
 logging.basicConfig(level=logging.ERROR, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -92,19 +99,6 @@ class FailedFilesLogger:
             self.failed_file.unlink()
 
 
-def get_log_files(field_name: str):
-    """获取日志文件路径"""
-    progress_dir = Path(PROGRESS_DIR)
-    failed_dir = Path(FAILED_DIR)
-    progress_dir.mkdir(parents=True, exist_ok=True)
-    failed_dir.mkdir(parents=True, exist_ok=True)
-    
-    progress_file = progress_dir / f"{field_name}_progress.txt"
-    failed_file = failed_dir / f"{field_name}_failed.txt"
-    
-    return str(progress_file), str(failed_file)
-
-
 def fast_extract_corpusid(line: str) -> int:
     """快速提取 corpusid"""
     try:
@@ -132,7 +126,7 @@ def fast_extract_corpusid(line: str) -> int:
 
 
 def extractor_worker(file_queue: Queue, data_queue: Queue, progress_queue: Queue,
-                    stats_dict: dict, field_name: str, batch_size: int = BATCH_SIZE):
+                    stats_dict: dict, batch_size: int = BATCH_SIZE):
     """生产者：解压并提取 corpusid"""
     import logging
     logging.getLogger().setLevel(logging.CRITICAL)
@@ -146,43 +140,77 @@ def extractor_worker(file_queue: Queue, data_queue: Queue, progress_queue: Queue
             gz_file_path, file_name = task
             
             try:
-                batch_set = set()
+                # 终极优化：跳过批内去重，直接用list（数据库层面去重更快）
+                batch_list = [] if SKIP_BATCH_DEDUP else set()
                 valid_count = 0
                 
                 try:
-                    with gzip.open(gz_file_path, 'rb') as f_binary:
-                        f = TextIOWrapper(BufferedReader(f_binary, buffer_size=32*1024*1024), 
-                                        encoding='utf-8', errors='ignore')
-                        
-                        for line in f:
-                            line = line.strip()
-                            if not line or len(line) < 15:
-                                continue
-                            
-                            corpusid = fast_extract_corpusid(line)
-                            if corpusid is None:
-                                continue
-                            
-                            valid_count += 1
-                            batch_set.add(corpusid)
-                            
-                            if len(batch_set) >= batch_size:
-                                data_queue.put(('data', field_name, file_name, list(batch_set)))
-                                batch_set.clear()
+                    # USB硬盘优化：检查文件大小，选择最优读取方式
+                    import os
+                    file_size = os.path.getsize(gz_file_path)
                     
-                    if batch_set:
-                        data_queue.put(('data', field_name, file_name, list(batch_set)))
+                    # 小文件（<1.5GB）：一次性读入内存，避免多次磁盘访问
+                    if file_size < SMALL_FILE_THRESHOLD:
+                        with gzip.open(gz_file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            for line in content.splitlines():
+                                line = line.strip()
+                                if not line or len(line) < 15:
+                                    continue
+                                
+                                corpusid = fast_extract_corpusid(line)
+                                if corpusid is None:
+                                    continue
+                                
+                                valid_count += 1
+                                if SKIP_BATCH_DEDUP:
+                                    batch_list.append(corpusid)
+                                    if len(batch_list) >= batch_size:
+                                        data_queue.put(('data', batch_list))
+                                        batch_list = []
+                                else:
+                                    batch_list.add(corpusid)
+                                    if len(batch_list) >= batch_size:
+                                        data_queue.put(('data', list(batch_list)))
+                                        batch_list.clear()
+                    else:
+                        # 大文件：流式读取，使用超大缓冲区（512MB）
+                        with gzip.open(gz_file_path, 'rb') as f_binary:
+                            f = TextIOWrapper(BufferedReader(f_binary, buffer_size=USB_BUFFER_SIZE), 
+                                            encoding='utf-8', errors='ignore')
+                            
+                            for line in f:
+                                line = line.strip()
+                                if not line or len(line) < 15:
+                                    continue
+                                
+                                corpusid = fast_extract_corpusid(line)
+                                if corpusid is None:
+                                    continue
+                                
+                                valid_count += 1
+                                if SKIP_BATCH_DEDUP:
+                                    batch_list.append(corpusid)
+                                    if len(batch_list) >= batch_size:
+                                        data_queue.put(('data', batch_list))
+                                        batch_list = []
+                                else:
+                                    batch_list.add(corpusid)
+                                    if len(batch_list) >= batch_size:
+                                        data_queue.put(('data', list(batch_list)))
+                                        batch_list.clear()
+                    
+                    if batch_list:
+                        if SKIP_BATCH_DEDUP:
+                            data_queue.put(('data', batch_list))
+                        else:
+                            data_queue.put(('data', list(batch_list)))
                     
                     progress_queue.put(('done', file_name, valid_count))
                     stats_dict['extracted'] = stats_dict.get('extracted', 0) + valid_count
                     
                 except (OSError, EOFError, ValueError, gzip.BadGzipFile):
-                    progress_queue.put(('error', file_name, "Corrupted file"))
-                    continue
-                except MemoryError:
-                    import gc
-                    gc.collect()
-                    progress_queue.put(('error', file_name, "Memory error"))
+                    progress_queue.put(('error', file_name, "Corrupted"))
                     continue
                 
             except Exception as e:
@@ -202,8 +230,8 @@ def inserter_worker(worker_id: int, data_queue: Queue, stats_dict: dict,
     buffer_pool = StringIO()
     
     try:
-        db_config = get_db_config('machine1')
-        conn = psycopg2.connect(**db_config)
+        config = db_config.DB_CONFIG
+        conn = psycopg2.connect(**config)
         conn.autocommit = False
         cursor = conn.cursor()
         
@@ -225,11 +253,10 @@ def inserter_worker(worker_id: int, data_queue: Queue, stats_dict: dict,
                     break
                 
                 elif item_type == 'data':
-                    _, field_name, gz_filename, corpusids = item
+                    _, corpusids = item
                     
                     try:
-                        inserted = batch_copy_insert(cursor, field_name, gz_filename, 
-                                                     corpusids, buffer_pool)
+                        inserted = batch_copy_insert(cursor, corpusids, buffer_pool)
                         batch_count += 1
                         
                         if batch_count >= commit_batches:
@@ -239,7 +266,6 @@ def inserter_worker(worker_id: int, data_queue: Queue, stats_dict: dict,
                         total_inserted += inserted
                     
                     except psycopg2.DatabaseError as e:
-                        logger.warning(f"[Inserter-{worker_id}] 插入错误: {e}")
                         conn.rollback()
                         batch_count = 0
                         try:
@@ -256,8 +282,7 @@ def inserter_worker(worker_id: int, data_queue: Queue, stats_dict: dict,
             
             except Empty:
                 continue
-            except Exception as e:
-                logger.error(f"[Inserter-{worker_id}] 错误: {e}")
+            except Exception:
                 if conn:
                     conn.rollback()
                 continue
@@ -276,9 +301,8 @@ def inserter_worker(worker_id: int, data_queue: Queue, stats_dict: dict,
             conn.close()
 
 
-def batch_copy_insert(cursor, field_name: str, gz_filename: str, 
-                     corpusids: list, buffer: StringIO = None) -> int:
-    """批量COPY插入（极速模式）"""
+def batch_copy_insert(cursor, corpusids: list, buffer: StringIO = None) -> int:
+    """批量COPY插入"""
     if not corpusids:
         return 0
     
@@ -289,18 +313,16 @@ def batch_copy_insert(cursor, field_name: str, gz_filename: str,
             buffer.seek(0)
             buffer.truncate(0)
         
-        # 构造 TSV 数据：corpusid \t gz_filename
+        # 构造数据：每行一个 corpusid
         for cid in corpusids:
             buffer.write(str(cid))
-            buffer.write('\t')
-            buffer.write(gz_filename)
             buffer.write('\n')
         
         buffer.seek(0)
         
-        # COPY 插入（只插入 corpusid 和对应字段）
+        # COPY 插入
         cursor.copy_expert(
-            f"COPY {TABLE_NAME} (corpusid, {field_name}) FROM STDIN",
+            f"COPY {TABLE_NAME} (corpusid) FROM STDIN",
             buffer
         )
         return len(corpusids)
@@ -310,18 +332,23 @@ def batch_copy_insert(cursor, field_name: str, gz_filename: str,
         raise
 
 
-def process_gz_folder_to_mapping(folder_path: str, field_name: str, 
-                                 num_extractors: int = NUM_EXTRACTORS,
-                                 num_inserters: int = NUM_INSERTERS,
-                                 resume: bool = True, reset_progress: bool = False):
-    """处理 GZ 文件夹，映射 corpusid 到 gz 文件名"""
+def process_gz_folder(folder_path: str, 
+                     num_extractors: int = NUM_EXTRACTORS,
+                     num_inserters: int = NUM_INSERTERS,
+                     resume: bool = True, 
+                     reset_progress: bool = False):
+    """处理 GZ 文件夹，提取所有 corpusid"""
     folder = Path(folder_path)
     if not folder.exists():
         raise ValueError(f"文件夹不存在: {folder_path}")
     
-    progress_file, failed_file = get_log_files(field_name)
-    tracker = ProgressTracker(progress_file)
-    failed_logger = FailedFilesLogger(failed_file)
+    # 使用文件夹名作为日志标识
+    folder_name = folder.name
+    progress_file = Path(PROGRESS_DIR) / f"{folder_name}_progress.txt"
+    failed_file = Path(FAILED_DIR) / f"{folder_name}_failed.txt"
+    
+    tracker = ProgressTracker(str(progress_file))
+    failed_logger = FailedFilesLogger(str(failed_file))
     
     if reset_progress:
         tracker.reset()
@@ -335,11 +362,17 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         logger.warning(f"未找到 .gz 文件: {folder_path}")
         return
     
+    # USB硬盘优化：按文件大小排序，先处理小文件
+    # 好处：1) 减少内存压力 2) 快速看到进度 3) 顺序访问磁盘
+    if SORT_BY_SIZE:
+        gz_files = sorted(gz_files, key=lambda f: f.stat().st_size)
+    
     excluded_files = completed_files | failed_files
     pending_files = [(str(f), f.name) for f in gz_files if f.name not in excluded_files]
     
-    logger.info(f"\n▶ [{field_name}] 提取:{num_extractors}进程 插入:{num_inserters}进程")
+    logger.info(f"\n📂 文件夹: {folder_name}")
     logger.info(f"   总计:{len(gz_files)} 已完成:{len(completed_files)} 待处理:{len(pending_files)}")
+    logger.info(f"   提取:{num_extractors}进程 插入:{num_inserters}进程")
     
     if not pending_files:
         logger.info("✅ 所有文件已处理完成\n")
@@ -361,7 +394,7 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         for _ in range(num_extractors):
             file_queue.put(None)
         
-        # 启动多个插入进程
+        # 启动插入进程
         inserters = []
         for i in range(num_inserters):
             p = Process(
@@ -377,7 +410,7 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         for i in range(num_extractors):
             p = Process(
                 target=extractor_worker,
-                args=(file_queue, data_queue, progress_queue, stats_dict, field_name, BATCH_SIZE),
+                args=(file_queue, data_queue, progress_queue, stats_dict, BATCH_SIZE),
                 name=f'Extractor-{i+1}'
             )
             p.start()
@@ -389,7 +422,6 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         last_log_time = time.time()
         start_time = time.time()
         
-        # 显示开始信息
         from datetime import datetime
         start_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"\n⏰ 开始时间: {start_datetime}")
@@ -410,7 +442,7 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
                     failed_logger.log_failed(file_name, error)
                     failed_count += 1
                 
-                # 实时更新进度（每秒）
+                # 实时更新进度
                 current_time = time.time()
                 if current_time - last_log_time >= 1:
                     elapsed = current_time - start_time
@@ -429,7 +461,6 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
                     else:
                         eta_str = "--:--:--"
                     
-                    # 格式化已用时间
                     elapsed_hours = int(elapsed // 3600)
                     elapsed_minutes = int((elapsed % 3600) // 60)
                     elapsed_secs = int(elapsed % 60)
@@ -450,7 +481,7 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         
         # 停止插入进程
         for _ in range(num_inserters):
-            data_queue.put(('stop', None, None, None))
+            data_queue.put(('stop', None))
         
         for p in inserters:
             p.join()
@@ -459,17 +490,15 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         total_inserted = sum(stats_dict.get(f'inserted_{i}', 0) for i in range(1, num_inserters+1))
         avg_rate = total_inserted / elapsed if elapsed > 0 else 0
         
-        # 格式化总耗时
         total_hours = int(elapsed // 3600)
         total_minutes = int((elapsed % 3600) // 60)
         total_secs = int(elapsed % 60)
         
-        from datetime import datetime
         end_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         print("\n")
         logger.info(f"{'='*70}")
-        logger.info(f"✅ [{field_name}] 处理完成")
+        logger.info(f"✅ [{folder_name}] 处理完成")
         logger.info(f"{'='*70}")
         logger.info(f"⏰ 结束时间: {end_datetime}")
         logger.info(f"📊 处理统计:")
@@ -488,34 +517,134 @@ def process_gz_folder_to_mapping(folder_path: str, field_name: str,
         sys.exit(1)
     except Exception as e:
         logger.error(f"\n❌ 错误: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
+
+
+def batch_process_folders(folders: list, 
+                          num_extractors: int = NUM_EXTRACTORS,
+                          num_inserters: int = NUM_INSERTERS,
+                          resume: bool = True):
+    """批量处理多个文件夹"""
+    logger.info("="*70)
+    logger.info(f"🚀 批量处理启动")
+    logger.info(f"   待处理: {len(folders)} 个文件夹")
+    for i, folder in enumerate(folders, 1):
+        logger.info(f"   [{i}] {folder}")
+    logger.info(f"   进程配置: 提取={num_extractors}, 插入={num_inserters}")
+    logger.info("="*70)
+    
+    overall_start = time.time()
+    success_count = 0
+    failed_folders = []
+    
+    for i, folder_path in enumerate(folders, 1):
+        folder = Path(folder_path)
+        
+        logger.info("")
+        logger.info(f"📁 [{i}/{len(folders)}] {folder.name}")
+        logger.info("-"*70)
+        
+        if not folder.exists():
+            logger.warning(f"⚠️  文件夹不存在: {folder_path}")
+            failed_folders.append(f"{folder.name} (不存在)")
+            continue
+        
+        try:
+            process_gz_folder(
+                folder_path=str(folder_path),
+                num_extractors=num_extractors,
+                num_inserters=num_inserters,
+                resume=resume,
+                reset_progress=False
+            )
+            
+            success_count += 1
+            logger.info(f"✅ {folder.name} 完成\n")
+            
+        except KeyboardInterrupt:
+            logger.warning(f"\n⚠️  用户中断 | 已完成: {success_count}/{len(folders)}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"❌ {folder.name} 失败: {e}")
+            failed_folders.append(f"{folder.name} ({str(e)})")
+            continue
+    
+    elapsed = time.time() - overall_start
+    
+    logger.info("")
+    logger.info("="*70)
+    logger.info("🏁 批量处理完成")
+    logger.info(f"   成功: {success_count}/{len(folders)} | 耗时: {elapsed/3600:.2f}小时")
+    
+    if failed_folders:
+        logger.warning("⚠️  失败列表:")
+        for folder in failed_folders:
+            logger.warning(f"     {folder}")
+    
+    logger.info("="*70)
+    
+    if success_count == len(folders):
+        logger.info("✅ 全部成功！")
+        logger.info("💡 运行去重和建索引: python scripts/all_corpusid_of_5dataset/init_table.py --finalize")
 
 
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='提取 corpusid 并映射到 gz 文件名')
-    parser.add_argument('--dir', type=str, required=True, help='GZ 文件夹路径')
-    parser.add_argument('--field', type=str, required=True, help='表字段名')
+    parser = argparse.ArgumentParser(
+        description='提取 gz 文件中的 corpusid 并插入到 final_delivery 表',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例：
+  # 单个文件夹
+  python scripts/all_corpusid_of_5dataset/extract_corpusid.py \\
+    --dir "E:\\data\\s2orc"
+  
+  # 批量处理多个文件夹
+  python scripts/all_corpusid_of_5dataset/extract_corpusid.py \\
+    --dirs "E:\\data\\s2orc" "E:\\data\\citations" "E:\\data\\papers"
+  
+  # 自定义进程数
+  python scripts/all_corpusid_of_5dataset/extract_corpusid.py \\
+    --dirs "E:\\data\\s2orc" "E:\\data\\citations" \\
+    --extractors 2 --inserters 6
+        """
+    )
+    
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--dir', type=str, help='单个GZ文件夹路径')
+    group.add_argument('--dirs', nargs='+', type=str, help='多个文件夹路径（空格分隔）')
+    
     parser.add_argument('--extractors', type=int, default=NUM_EXTRACTORS, 
                        help=f'提取进程数（默认: {NUM_EXTRACTORS}）')
     parser.add_argument('--inserters', type=int, default=NUM_INSERTERS, 
                        help=f'插入进程数（默认: {NUM_INSERTERS}）')
-    parser.add_argument('--no-resume', action='store_true', help='禁用断点续传（默认启用）')
-    parser.add_argument('--reset', action='store_true', help='重置进度（清空已完成记录）')
+    parser.add_argument('--no-resume', action='store_true', help='禁用断点续传')
+    parser.add_argument('--reset', action='store_true', help='重置进度')
     
     args = parser.parse_args()
     
-    process_gz_folder_to_mapping(
-        folder_path=args.dir,
-        field_name=args.field,
-        num_extractors=args.extractors,
-        num_inserters=args.inserters,
-        resume=not args.no_resume,  # 默认启用断点续传
-        reset_progress=args.reset
-    )
+    # 单个文件夹处理
+    if args.dir:
+        process_gz_folder(
+            folder_path=args.dir,
+            num_extractors=args.extractors,
+            num_inserters=args.inserters,
+            resume=not args.no_resume,
+            reset_progress=args.reset
+        )
+    
+    # 批量处理
+    elif args.dirs:
+        batch_process_folders(
+            folders=args.dirs,
+            num_extractors=args.extractors,
+            num_inserters=args.inserters,
+            resume=not args.no_resume
+        )
 
 
 if __name__ == '__main__':
     main()
-

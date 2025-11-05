@@ -13,8 +13,8 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from database.config import db_config_v2
-from database.config.db_config_v2 import FIELD_TABLES, TABLESPACE_CONFIG, get_db_config
+import db_config
+from db_config import FIELD_TABLES, TABLESPACE_CONFIG, get_db_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -29,10 +29,10 @@ def get_connection_params(database='postgres'):
     """Get connection parameters with forced settings"""
     params = {
         'host': '127.0.0.1',  # Use 127.0.0.1 instead of localhost
-        'port': db_config_v2.DB_CONFIG['port'],
+        'port': db_config.DB_CONFIG['port'],
         'database': database,
-        'user': db_config_v2.DB_CONFIG['user'],
-        'password': db_config_v2.DB_CONFIG['password'],
+        'user': db_config.DB_CONFIG['user'],
+        'password': db_config.DB_CONFIG['password'],
         'options': '-c lc_messages=C -c client_encoding=UTF8'
     }
     return params
@@ -40,7 +40,7 @@ def get_connection_params(database='postgres'):
 
 def create_database():
     """Create database if not exists"""
-    db_name = db_config_v2.DB_CONFIG['database']
+    db_name = db_config.DB_CONFIG['database']
     
     try:
         conn = psycopg2.connect(**get_connection_params('postgres'))
@@ -106,7 +106,7 @@ def create_database():
 def create_tables(tables: list = None):
     """Create tables (UNLOGGED, no indexes, TEXT type for data)"""
     try:
-        conn = psycopg2.connect(**get_connection_params(db_config_v2.DB_CONFIG['database']))
+        conn = psycopg2.connect(**get_connection_params(db_config.DB_CONFIG['database']))
         conn.autocommit = True
         cursor = conn.cursor()
         
@@ -234,9 +234,9 @@ Examples:
         # 根据机器ID更新数据库配置
         if args.machine:
             db_config = get_db_config(args.machine)
-            db_config_v2.DB_CONFIG.update(db_config)
+            db_config.DB_CONFIG.update(db_config)
             logger.info(f"Machine: {args.machine}")
-            logger.info(f"Database: {db_config_v2.DB_CONFIG['database']}\n")
+            logger.info(f"Database: {db_config.DB_CONFIG['database']}\n")
         
         create_database()
         
@@ -252,9 +252,6 @@ Examples:
         
         create_tables(tables)
         logger.info("\nDatabase initialization completed!")
-        
-        if args.machine:
-            logger.info(f"Next: python scripts/batch_process_machine.py --machine {args.machine} --base-dir \"F:\\machine_win01\\2025-09-30\"\n")
     else:
         parser.print_help()
 

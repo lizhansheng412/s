@@ -15,8 +15,8 @@ import psycopg2
 import psycopg2.extras
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from database.config import db_config_v2
-from database.config.db_config_v2 import get_db_config
+import db_config
+from db_config import get_db_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ def merge_citations_duplicates():
     将 data 字段合并为 JSON 数组
     """
     try:
-        conn = psycopg2.connect(**db_config_v2.DB_CONFIG)
+        conn = psycopg2.connect(**db_config.DB_CONFIG)
         conn.autocommit = True
         cursor = conn.cursor()
         
@@ -141,10 +141,10 @@ def main():
     
     if args.machine:
         db_config = get_db_config(args.machine)
-        db_config_v2.DB_CONFIG.update(db_config)
-        logger.info(f"数据库: {db_config_v2.DB_CONFIG['database']} (机器: {args.machine})\n")
+        db_config.DB_CONFIG.update(db_config)
+        logger.info(f"数据库: {db_config.DB_CONFIG['database']} (机器: {args.machine})\n")
     else:
-        logger.info(f"数据库: {db_config_v2.DB_CONFIG['database']}\n")
+        logger.info(f"数据库: {db_config.DB_CONFIG['database']}\n")
     
     merge_citations_duplicates()
 
