@@ -21,7 +21,6 @@ ENV/
 # 日志文件
 *.log
 logs/
-scripts/merge/failed_corposid
 
 # 数据文件
 *.gz
@@ -41,3 +40,7 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# 临时文件和日志
+temp_file_list.txt
+debug.log
+failed_corposid
