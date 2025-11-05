@@ -14,7 +14,7 @@ import orjson  # 比json快2-3倍
 import psycopg2
 from datetime import datetime
 import time
-from db_config import DB_CONFIG
+from db_config import get_db_config, MACHINE_DB_MAP
 from init_temp_table import GZ_LOG_TABLE, DATASET_TYPES
 
 TEMP_TABLE = "temp_import"
@@ -164,7 +164,7 @@ def log_imported_file(cursor, filename, data_type):
     )
 
 
-def import_gz_to_temp_fast(gz_file_path, data_type=None):
+def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
     """
     从单个gz文件快速导入数据到临时表
     使用COPY命令，分块写入，减少内存峰值
@@ -178,6 +178,7 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None):
     Args:
         gz_file_path: gz文件路径
         data_type: 数据集类型（必需，用于记录和跳过已处理文件）
+        machine_id: 目标机器ID
     """
     if data_type is None:
         raise ValueError(f"必须指定--dataset参数，可选值: {', '.join(DATASET_TYPES)}")
@@ -193,7 +194,8 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None):
     
     try:
         # 连接数据库
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         # 检查文件是否已导入
@@ -279,7 +281,7 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None):
             conn.close()
 
 
-def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False):
+def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machine_id='machine0'):
     """
     顺序导入目录下的所有gz文件
     使用分块COPY和优化的解析策略
@@ -288,6 +290,7 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False):
         gz_directory: 包含gz文件的目录
         data_type: 数据集类型（必需，用于记录和跳过已处理文件）
         delete_gz: 是否在处理完成后删除所有gz文件（默认False）
+        machine_id: 目标机器ID
     """
     if data_type is None:
         raise ValueError(f"必须指定--dataset参数，可选值: {', '.join(DATASET_TYPES)}")
@@ -308,7 +311,9 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False):
     
     try:
         # 连接数据库
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         # 检查已导入的文件
@@ -522,14 +527,14 @@ if __name__ == "__main__":
   {', '.join(DATASET_TYPES)}
 
 使用示例:
-  # 导入但保留gz文件（默认，安全模式）
+  # 导入到 machine0 (默认)
   python batch_update/import_gz_to_temp.py D:\\gz_temp\\s2orc --dataset s2orc
   
-  # 导入并删除所有gz文件（需明确指定）
-  python batch_update/import_gz_to_temp.py D:\\gz_temp\\s2orc --dataset s2orc --delete-gz
+  # 导入到 machine1
+  python batch_update/import_gz_to_temp.py D:\\gz_temp\\s2orc --dataset s2orc --machine machine1
   
-  # 单文件导入
-  python batch_update/import_gz_to_temp.py file.gz --dataset embeddings_specter_v1
+  # 导入并删除所有gz文件
+  python batch_update/import_gz_to_temp.py D:\\gz_temp\\s2orc --dataset s2orc --delete-gz
         """
     )
     parser.add_argument("path", help="gz文件路径或包含gz文件的目录")
@@ -539,6 +544,8 @@ if __name__ == "__main__":
         choices=DATASET_TYPES,
         help="数据集类型（必需）"
     )
+    parser.add_argument("--machine", default="machine0", choices=list(MACHINE_DB_MAP.keys()), 
+                        help="目标机器 (默认: machine0)")
     parser.add_argument(
         "--delete-gz",
         action="store_true",
@@ -549,9 +556,9 @@ if __name__ == "__main__":
     path = Path(args.path)
     
     if path.is_file():
-        import_gz_to_temp_fast(path, data_type=args.dataset)
+        import_gz_to_temp_fast(path, data_type=args.dataset, machine_id=args.machine)
     elif path.is_dir():
-        import_multiple_gz_fast(path, data_type=args.dataset, delete_gz=args.delete_gz)
+        import_multiple_gz_fast(path, data_type=args.dataset, delete_gz=args.delete_gz, machine_id=args.machine)
     else:
         print(f"错误: {path} 不是有效的文件或目录")
 

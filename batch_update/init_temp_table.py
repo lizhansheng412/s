@@ -11,7 +11,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import psycopg2
-from db_config import DB_CONFIG
+from db_config import get_db_config, MACHINE_DB_MAP
 
 
 INDEX_DEFINITIONS = [
@@ -33,7 +33,7 @@ GZ_LOG_TABLE = "gz_import_log"
 DATASET_TYPES = ['s2orc', 'embeddings_specter_v1', 'embeddings_specter_v2', 'citations']
 
 
-def init_temp_table():
+def init_temp_table(machine_id='machine0'):
     """
     创建通用临时表
     
@@ -48,8 +48,9 @@ def init_temp_table():
     cursor = None
     
     try:
-        print("连接到数据库...")
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         # 创建UNLOGGED表（更快，适合临时数据）
@@ -98,14 +99,15 @@ def init_temp_table():
             conn.close()
 
 
-def drop_temp_table():
+def drop_temp_table(machine_id='machine0'):
     """删除通用临时表（慎用）"""
     conn = None
     cursor = None
     
     try:
-        print("连接到数据库...")
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         # 删除表
@@ -128,14 +130,15 @@ def drop_temp_table():
             conn.close()
 
 
-def truncate_temp_table():
+def truncate_temp_table(machine_id='machine0'):
     """清空通用临时表并删除索引"""
     conn = None
     cursor = None
     
     try:
-        print("连接到数据库...")
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         # 删除索引
@@ -164,14 +167,15 @@ def truncate_temp_table():
             conn.close()
 
 
-def create_indexes():
+def create_indexes(machine_id='machine0'):
     """为临时表创建所需索引"""
     conn = None
     cursor = None
 
     try:
-        print("连接到数据库...")
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
 
         for index_name, sql_builder in INDEX_DEFINITIONS:
@@ -195,7 +199,7 @@ def create_indexes():
             conn.close()
 
 
-def init_gz_log_table():
+def init_gz_log_table(machine_id='machine0'):
     """
     创建gz文件导入记录表
     
@@ -210,8 +214,9 @@ def init_gz_log_table():
     cursor = None
     
     try:
-        print("连接到数据库...")
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         # 创建记录表
@@ -264,14 +269,15 @@ def init_gz_log_table():
             conn.close()
 
 
-def clear_gz_log_table():
+def clear_gz_log_table(machine_id='machine0'):
     """清空gz文件导入记录表"""
     conn = None
     cursor = None
     
     try:
-        print("连接到数据库...")
-        conn = psycopg2.connect(**DB_CONFIG)
+        db_config = get_db_config(machine_id)
+        print(f"连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
         print(f"清空{GZ_LOG_TABLE}表...")
@@ -297,6 +303,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="初始化通用临时表")
+    parser.add_argument("--machine", default="machine0", choices=list(MACHINE_DB_MAP.keys()), 
+                        help=f"目标机器 (默认: machine0)")
     parser.add_argument("--drop", action="store_true", help="删除表（慎用）")
     parser.add_argument("--truncate", action="store_true", help="清空表")
     parser.add_argument(
@@ -316,20 +324,22 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     
+    machine_id = args.machine
+    
     if args.drop:
         response = input(f"确认要删除{TEMP_TABLE}表吗？(yes/no): ")
         if response.lower() == "yes":
-            drop_temp_table()
+            drop_temp_table(machine_id)
         else:
             print("已取消")
     elif args.truncate:
-        truncate_temp_table()
+        truncate_temp_table(machine_id)
     elif args.create_indexes:
-        create_indexes()
+        create_indexes(machine_id)
     elif args.init_log_table:
-        init_gz_log_table()
+        init_gz_log_table(machine_id)
     elif args.clear_log:
-        clear_gz_log_table()
+        clear_gz_log_table(machine_id)
     else:
-        init_temp_table()
+        init_temp_table(machine_id)
 

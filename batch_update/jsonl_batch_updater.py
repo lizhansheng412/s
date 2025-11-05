@@ -14,7 +14,7 @@ from tqdm import tqdm
 from datetime import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
-from db_config import DB_CONFIG
+from db_config import get_db_config, MACHINE_DB_MAP
 
 # 尝试导入 win32file（Windows 优化）
 try:
@@ -114,7 +114,9 @@ def batch_copy_with_powershell(filenames: list[str], src_dir: Path, dst_dir: Pat
 class JSONLBatchUpdater:
     """JSONL批量更新器"""
     
-    def __init__(self):
+    def __init__(self, machine_id='machine0'):
+        self.machine_id = machine_id
+        self.db_config = get_db_config(machine_id)
         self.conn = None
         self.failed_corpusids = []
         # 线程池：用于后台复制文件（最多1个并发）
@@ -122,7 +124,8 @@ class JSONLBatchUpdater:
     
     def connect_db(self):
         """连接数据库"""
-        self.conn = psycopg2.connect(**DB_CONFIG)
+        print(f"连接到数据库 [{self.machine_id}: {self.db_config['database']}:{self.db_config['port']}]...")
+        self.conn = psycopg2.connect(**self.db_config)
     
     def close_db(self):
         """关闭数据库连接"""
@@ -593,7 +596,14 @@ class JSONLBatchUpdater:
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="JSONL批量更新器")
+    parser.add_argument("--machine", default="machine0", choices=list(MACHINE_DB_MAP.keys()), 
+                        help="目标机器 (默认: machine0)")
+    args = parser.parse_args()
+    
     # 配置参数见文件顶部配置区
-    updater = JSONLBatchUpdater()
+    updater = JSONLBatchUpdater(machine_id=args.machine)
     updater.run()
 
