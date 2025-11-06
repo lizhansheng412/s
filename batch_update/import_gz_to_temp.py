@@ -14,6 +14,7 @@ import orjson  # 比json快2-3倍
 import psycopg2
 from datetime import datetime
 import time
+import threading
 from db_config import get_db_config, MACHINE_DB_MAP
 from init_temp_table import GZ_LOG_TABLE, DATASET_TYPES
 
@@ -24,7 +25,12 @@ COPY_SQL = (
     "FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '')"
 )
 DEBUG_LOG = Path(__file__).parent.parent / "debug.log"
-FAILED_GZ_LOG = Path(__file__).parent.parent / "logs" / "batch_update" / "gz_import_failed.txt"
+FAILED_LOG_BASE = Path(__file__).parent.parent / "logs" / "batch_update"
+
+
+def get_failed_log_path(data_type):
+    """获取指定数据集的失败日志路径"""
+    return FAILED_LOG_BASE / data_type / "gz_import_failed.txt"
 
 
 def log_performance(stage, **metrics):
@@ -38,10 +44,11 @@ def log_performance(stage, **metrics):
 
 def log_failed_file(filename, data_type, error):
     """记录失败的gz文件"""
-    FAILED_GZ_LOG.parent.mkdir(parents=True, exist_ok=True)
+    failed_log = get_failed_log_path(data_type)
+    failed_log.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_line = f"[{timestamp}] {filename} | dataset={data_type} | error={error}\n"
-    with open(FAILED_GZ_LOG, 'a', encoding='utf-8') as f:
+    log_line = f"[{timestamp}] {filename} | error={error}\n"
+    with open(failed_log, 'a', encoding='utf-8') as f:
         f.write(log_line)
 
 
@@ -87,50 +94,30 @@ class CopyStream:
 
 
 def load_failed_files(data_type):
-    """
-    从失败日志中读取指定dataset的失败文件列表
-    返回: set of filenames
-    """
-    if not FAILED_GZ_LOG.exists():
+    """从失败日志中读取指定dataset的失败文件列表"""
+    failed_log = get_failed_log_path(data_type)
+    if not failed_log.exists():
         return set()
     
     failed_files = set()
-    
     try:
-        with open(FAILED_GZ_LOG, 'r', encoding='utf-8') as f:
+        with open(failed_log, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                
-                # 跳过空行
-                if not line:
+                if not line or line.startswith('#'):
                     continue
                 
-                # 跳过注释行
-                if line.startswith('#'):
-                    continue
-                
-                # 解析日志行：[timestamp] filename | dataset=xxx | error=xxx
+                # 解析: [timestamp] filename | error=xxx
                 if line.startswith('['):
                     try:
-                        # 提取文件名
                         parts = line.split('|')
-                        if len(parts) >= 2:
-                            # 从第一部分提取文件名（在]之后）
-                            filename_part = parts[0].split(']', 1)[1].strip()
-                            
-                            # 从第二部分提取dataset
-                            dataset_part = parts[1].strip()
-                            if dataset_part.startswith('dataset='):
-                                file_dataset = dataset_part.split('=', 1)[1].strip()
-                                
-                                # 只记录匹配的dataset
-                                if file_dataset == data_type:
-                                    failed_files.add(filename_part)
+                        if len(parts) >= 1:
+                            filename = parts[0].split(']', 1)[1].strip()
+                            failed_files.add(filename)
                     except:
                         continue
-    
     except Exception as e:
-        print(f"⚠️  读取失败日志时出错: {e}")
+        print(f"WARNING: Failed to read failed log - {e}")
         return set()
     
     return failed_files
@@ -145,6 +132,29 @@ def delete_gz_file(gz_path):
     except Exception as e:
         print(f"  ⚠️  删除文件失败（忽略）: {e}")
         return False
+
+
+def start_cleanup_monitor(gz_directory, data_type, machine_id):
+    """在后台线程启动清理监控
+    
+    注意：使用 daemon=True 确保主进程结束时监控线程也会自动终止
+    """
+    try:
+        # 导入监控函数
+        from cleanup_imported_gz import monitor_and_cleanup
+        
+        # 启动守护线程：主进程结束时会自动终止
+        monitor_thread = threading.Thread(
+            target=monitor_and_cleanup,
+            args=(gz_directory, data_type, machine_id),
+            daemon=True,  # 守护线程：主进程退出时自动终止
+            name="DiskSpaceMonitor"
+        )
+        monitor_thread.start()
+        
+        print(f"已启动磁盘空间监控 (阈值: 20GB, 间隔: 15分钟)")
+    except Exception as e:
+        print(f"WARNING: Failed to start cleanup monitor - {e}")
 
 
 def is_file_imported(cursor, filename, data_type):
@@ -210,6 +220,9 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
         # 关闭同步提交，提速20-30%（临时数据可接受风险）
         cursor.execute("SET LOCAL synchronous_commit = OFF;")
         
+        # 根据数据集类型决定提取的字段
+        field_name = 'vector' if data_type in ['embeddings_specter_v1', 'embeddings_specter_v2'] else 'content'
+        
         total_count = 0
 
         def row_iterator():
@@ -245,9 +258,9 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
                                 # 其他数据集必须有 content 字段
                                 continue
 
-                        content_json = orjson.dumps(content_obj).decode('utf-8')
+                        field_json = orjson.dumps(field_obj).decode('utf-8')
                         # TEXT格式：手动转义特殊字符
-                        escaped = content_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                        escaped = field_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                         row = f"{corpusid}\t{escaped}\tf\n"
                         total_count += 1
                         yield row.encode('utf-8')
@@ -325,6 +338,9 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
     cursor = None
     overall_start = time.time()
     
+    # 启动磁盘空间监控
+    start_cleanup_monitor(gz_directory, data_type, machine_id)
+    
     try:
         # 连接数据库
         db_config = get_db_config(machine_id)
@@ -400,6 +416,9 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
         # 关闭同步提交，提速20-30%
         cursor.execute("SET synchronous_commit = OFF;")
         
+        # 根据数据集类型决定提取的字段
+        field_name = 'vector' if data_type in ['embeddings_specter_v1', 'embeddings_specter_v2'] else 'content'
+        
         total_imported = 0
         skipped_count = 0
         failed_count = 0
@@ -447,9 +466,9 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
                                     # 其他数据集必须有 content 字段
                                     continue
 
-                            content_json = orjson.dumps(content_obj).decode('utf-8')
+                            field_json = orjson.dumps(field_obj).decode('utf-8')
                             # TEXT格式：手动转义特殊字符
-                            escaped = content_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                            escaped = field_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                             row = f"{corpusid}\t{escaped}\tf\n"
                             file_count += 1
                             yield row.encode('utf-8')
@@ -496,7 +515,7 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
         
         if failed_count > 0:
             print(f"\n⚠️  有 {failed_count} 个文件导入失败，详细信息已记录到:")
-            print(f"   {FAILED_GZ_LOG}")
+            print(f"   {get_failed_log_path(data_type)}")
         
         # 根据开关决定是否清空整个目录的所有 .gz 文件
         if delete_gz:
