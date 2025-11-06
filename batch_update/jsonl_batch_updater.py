@@ -265,6 +265,30 @@ class JSONLBatchUpdater:
         except ValueError:
             return None
     
+    def _parse_data(self, data):
+        """解析临时表中的data字段值（确保返回对象而非字符串）
+        
+        Args:
+            data: 临时表中的data字段值（可能是对象、字符串或bytes）
+        
+        Returns:
+            解析后的Python对象（dict、list等）
+        """
+        # 如果已经是Python对象，直接返回
+        if isinstance(data, (dict, list)):
+            return data
+        
+        # 如果是字符串或bytes，尝试解析JSON
+        if isinstance(data, (str, bytes)):
+            try:
+                return orjson.loads(data)
+            except:
+                # 解析失败，返回原始数据
+                return data
+        
+        # 其他类型直接返回
+        return data
+    
     def _apply_update(self, record: dict, data: str) -> bool:
         """根据数据集类型应用更新到记录
         
@@ -281,28 +305,30 @@ class JSONLBatchUpdater:
             if record.get('content') and record['content'] != {}:
                 return False  # content已有值，跳过
             
-            # 尝试解析data（可能是JSON字符串）
-            try:
-                content_data = orjson.loads(data) if isinstance(data, (str, bytes)) else data
-            except:
-                content_data = data
+            # 解析data（确保得到对象而非字符串）
+            content_data = self._parse_data(data)
             
             # 优先使用content字段，否则组合body + bibliography
             if isinstance(content_data, dict):
                 if 'content' in content_data and content_data['content']:
-                    record['content'] = content_data['content']
+                    # content字段可能也需要解析
+                    record['content'] = self._parse_data(content_data['content'])
                 else:
                     # 组合 body + bibliography
                     combined = {}
                     if 'body' in content_data:
-                        combined.update(content_data.get('body', {}))
+                        body_data = self._parse_data(content_data['body'])
+                        if body_data:  # body 有数据
+                            combined['body'] = body_data
                     if 'bibliography' in content_data:
-                        combined['bibliography'] = content_data.get('bibliography', {})
+                        bibliography_data = self._parse_data(content_data['bibliography'])
+                        if bibliography_data:  # bibliography 有数据
+                            combined['bibliography'] = bibliography_data
                     if combined:
                         record['content'] = combined
             else:
-                # data直接是字符串，直接赋值
-                record['content'] = content_data
+                # 如果解析后还不是dict，说明数据格式不对，跳过
+                return False
             
             return True
         
@@ -315,10 +341,13 @@ class JSONLBatchUpdater:
             # 确定model名称
             model_name = 'specter_v1' if self.dataset == 'embeddings_specter_v1' else 'specter_v2'
             
-            # 构造embedding结构（vector直接使用data字段值）
+            # 解析vector数据（确保是数组而非字符串）
+            vector_data = self._parse_data(data)
+            
+            # 构造embedding结构
             record['embedding'] = {
                 "model": model_name,
-                "vector": data
+                "vector": vector_data
             }
             return True
         
