@@ -224,10 +224,26 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
                             continue
 
                         corpusid = data.get('corpusid')
-                        content_obj = data.get('content')
-
-                        if corpusid is None or content_obj is None:
+                        if corpusid is None:
                             continue
+
+                        # 支持两种格式：优先使用 content，否则组合 body + bibliography
+                        content_obj = data.get('content')
+                        if content_obj is None:
+                            # 针对 s2orc 和 s2orc_v2：构建 content 对象
+                            if data_type in ('s2orc', 's2orc_v2'):
+                                content_obj = {}
+                                if 'body' in data:
+                                    content_obj['body'] = data['body']
+                                if 'bibliography' in data:
+                                    content_obj['bibliography'] = data['bibliography']
+                                
+                                # 如果既没有 body 也没有 bibliography，跳过该记录
+                                if not content_obj:
+                                    continue
+                            else:
+                                # 其他数据集必须有 content 字段
+                                continue
 
                         content_json = orjson.dumps(content_obj).decode('utf-8')
                         # TEXT格式：手动转义特殊字符
@@ -410,10 +426,26 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
                                 continue
 
                             corpusid = data.get('corpusid')
-                            content_obj = data.get('content')
-
-                            if corpusid is None or content_obj is None:
+                            if corpusid is None:
                                 continue
+
+                            # 支持两种格式：优先使用 content，否则组合 body + bibliography
+                            content_obj = data.get('content')
+                            if content_obj is None:
+                                # 针对 s2orc 和 s2orc_v2：构建 content 对象
+                                if data_type in ('s2orc', 's2orc_v2'):
+                                    content_obj = {}
+                                    if 'body' in data:
+                                        content_obj['body'] = data['body']
+                                    if 'bibliography' in data:
+                                        content_obj['bibliography'] = data['bibliography']
+                                    
+                                    # 如果既没有 body 也没有 bibliography，跳过该记录
+                                    if not content_obj:
+                                        continue
+                                else:
+                                    # 其他数据集必须有 content 字段
+                                    continue
 
                             content_json = orjson.dumps(content_obj).decode('utf-8')
                             # TEXT格式：手动转义特殊字符
@@ -535,6 +567,9 @@ if __name__ == "__main__":
   
   # 导入并删除所有gz文件
   python batch_update/import_gz_to_temp.py D:\\gz_temp\\s2orc --dataset s2orc --delete-gz
+  
+  # 自动流水线模式（导入→建索引→更新JSONL）
+  python batch_update/import_gz_to_temp.py D:\\gz_temp\\s2orc --dataset s2orc --auto-pipeline
         """
     )
     parser.add_argument("path", help="gz文件路径或包含gz文件的目录")
@@ -551,14 +586,50 @@ if __name__ == "__main__":
         action="store_true",
         help="处理完成后删除所有gz文件（默认不删除，需要明确指定）"
     )
+    parser.add_argument(
+        "--auto-pipeline",
+        action="store_true",
+        help="自动流水线模式：导入完成后自动执行建索引和JSONL更新"
+    )
     args = parser.parse_args()
     
     path = Path(args.path)
     
+    # 执行导入
     if path.is_file():
         import_gz_to_temp_fast(path, data_type=args.dataset, machine_id=args.machine)
     elif path.is_dir():
         import_multiple_gz_fast(path, data_type=args.dataset, delete_gz=args.delete_gz, machine_id=args.machine)
     else:
         print(f"错误: {path} 不是有效的文件或目录")
+        sys.exit(1)
+    
+    # 如果启用自动流水线，继续执行后续步骤
+    if args.auto_pipeline:
+        print("\n" + "=" * 80)
+        print("【自动流水线】步骤 2/3: 创建索引")
+        print("=" * 80)
+        
+        try:
+            from init_temp_table import create_indexes
+            create_indexes(machine_id=args.machine)
+        except Exception as e:
+            print(f"✗ 创建索引失败: {e}")
+            sys.exit(1)
+        
+        print("\n" + "=" * 80)
+        print("【自动流水线】步骤 3/3: 更新JSONL文件")
+        print("=" * 80)
+        
+        try:
+            from jsonl_batch_updater import JSONLBatchUpdater
+            updater = JSONLBatchUpdater(machine_id=args.machine)
+            updater.run()
+        except Exception as e:
+            print(f"✗ 更新JSONL失败: {e}")
+            sys.exit(1)
+        
+        print("\n" + "=" * 80)
+        print("【自动流水线完成】所有步骤执行成功！")
+        print("=" * 80)
 

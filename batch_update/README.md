@@ -30,6 +30,23 @@ python batch_update/init_temp_table.py --machine machine2 --init-log-table
 
 ## 2. 导入数据（必须指定数据集类型）
 
+### 2.1 自动流水线模式（推荐）
+
+一键执行：导入 → 建索引 → 更新JSONL
+
+```bash
+# 导入到 machine0 (默认)
+python batch_update/import_gz_to_temp.py D:\gz_temp\s2orc --dataset s2orc --auto-pipeline
+
+# 导入到 machine1
+python batch_update/import_gz_to_temp.py D:\gz_temp\s2orc --dataset s2orc --machine machine1 --auto-pipeline
+
+# 导入到 machine2，自动流水线 + 删除gz文件
+python batch_update/import_gz_to_temp.py D:\gz_temp\s2orc --dataset s2orc --machine machine2 --auto-pipeline --delete-gz
+```
+
+### 2.2 手动分步模式
+
 ```bash
 # 导入到 machine0 (默认)
 python batch_update/import_gz_to_temp.py D:\gz_temp\s2orc --dataset s2orc
@@ -108,7 +125,21 @@ python batch_update/init_temp_table.py --machine machine1 --clear-log
 
 ## 常用工作流
 
-### 完整流程示例（machine1）
+### 快速开始（自动流水线模式，推荐）
+
+```bash
+# 首次使用：创建表（只需执行一次）
+python batch_update/init_temp_table.py --machine machine1
+python batch_update/init_temp_table.py --machine machine1 --init-log-table
+
+# 一键完成：导入 → 建索引 → 更新JSONL
+python batch_update/import_gz_to_temp.py D:\gz_temp\s2orc --dataset s2orc --machine machine1 --auto-pipeline
+
+# 清空临时表（准备下次导入）
+python batch_update/init_temp_table.py --machine machine1 --truncate
+```
+
+### 完整流程示例（手动分步模式）
 
 ```bash
 # 1. 创建表
@@ -149,3 +180,4 @@ python batch_update/import_gz_to_temp.py D:\gz_temp\batch3 --dataset s2orc --mac
 2. **数据集类型**: 导入命令必须指定 `--dataset` 参数
 3. **删除文件**: 使用 `--delete-gz` 需谨慎，确保数据已成功导入
 4. **索引创建**: 大量数据导入后再创建索引，提升导入速度
+5. **自动流水线**: 使用 `--auto-pipeline` 可一键完成导入→建索引→更新JSONL的全流程，推荐使用
