@@ -38,6 +38,9 @@ USE_BATCH_COPY = False    # True=批量复制模式（快），False=逐个文�
 # 数据库配置
 TEMP_TABLE = "temp_import"
 
+# 数据集类型配置
+SUPPORTED_DATASETS = ['s2orc', 's2orc_v2', 'embeddings_specter_v1', 'embeddings_specter_v2', 'citations']
+
 # 初始化
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,8 +117,9 @@ def batch_copy_with_powershell(filenames: list[str], src_dir: Path, dst_dir: Pat
 class JSONLBatchUpdater:
     """JSONL批量更新器"""
     
-    def __init__(self, machine_id='machine0'):
+    def __init__(self, machine_id, dataset):
         self.machine_id = machine_id
+        self.dataset = dataset
         self.db_config = get_db_config(machine_id)
         self.conn = None
         self.failed_corpusids = []
@@ -260,6 +264,71 @@ class JSONLBatchUpdater:
             return int(line[idx:end])
         except ValueError:
             return None
+    
+    def _apply_update(self, record: dict, data: str) -> bool:
+        """根据数据集类型应用更新到记录
+        
+        Args:
+            record: JSONL记录（dict）
+            data: 临时表中的data字段值
+        
+        Returns:
+            bool: 是否成功更新（True=已更新，False=跳过）
+        """
+        if self.dataset in ['s2orc', 's2orc_v2']:
+            # s2orc类型：更新content字段
+            # 只有当 content 为空字典时才更新
+            if record.get('content') and record['content'] != {}:
+                return False  # content已有值，跳过
+            
+            # 尝试解析data（可能是JSON字符串）
+            try:
+                content_data = orjson.loads(data) if isinstance(data, (str, bytes)) else data
+            except:
+                content_data = data
+            
+            # 优先使用content字段，否则组合body + bibliography
+            if isinstance(content_data, dict):
+                if 'content' in content_data and content_data['content']:
+                    record['content'] = content_data['content']
+                else:
+                    # 组合 body + bibliography
+                    combined = {}
+                    if 'body' in content_data:
+                        combined.update(content_data.get('body', {}))
+                    if 'bibliography' in content_data:
+                        combined['bibliography'] = content_data.get('bibliography', {})
+                    if combined:
+                        record['content'] = combined
+            else:
+                # data直接是字符串，直接赋值
+                record['content'] = content_data
+            
+            return True
+        
+        elif self.dataset in ['embeddings_specter_v1', 'embeddings_specter_v2']:
+            # embedding类型：更新embedding字段
+            # 只有当 embedding 为空字典时才更新
+            if record.get('embedding') and record['embedding'] != {}:
+                return False  # embedding已有值，跳过
+            
+            # 确定model名称
+            model_name = 'specter_v1' if self.dataset == 'embeddings_specter_v1' else 'specter_v2'
+            
+            # 构造embedding结构（vector直接使用data字段值）
+            record['embedding'] = {
+                "model": model_name,
+                "vector": data
+            }
+            return True
+        
+        elif self.dataset == 'citations':
+            # citations类型：暂时不处理（逻辑待定）
+            return False
+        
+        else:
+            # 未知类型，跳过处理
+            return False
 
     
     def update_jsonl_file_from_local(self, filename, updates, skip_copy_in=False, skip_copy_out=False, copy_in_time=0):
@@ -317,11 +386,17 @@ class JSONLBatchUpdater:
             corpusid = self._extract_corpusid(line)
             
             if corpusid in updates_dict:
-                # 需要更新：解析JSON → 更新content → 序列化
+                # 需要更新：解析JSON → 应用更新 → 序列化
                 record = orjson.loads(line)
-                record['content'] = updates_dict[corpusid]
-                updated_corpusids.append(corpusid)
-                output_lines.append(orjson.dumps(record))
+                data = updates_dict[corpusid]
+                
+                # 根据数据集类型应用更新
+                if self._apply_update(record, data):
+                    updated_corpusids.append(corpusid)
+                    output_lines.append(orjson.dumps(record))
+                else:
+                    # 跳过更新（字段已有值），保留原样
+                    output_lines.append(line)
             else:
                 # 不需要更新：原样保留
                 output_lines.append(line)
@@ -387,6 +462,7 @@ class JSONLBatchUpdater:
         print("=" * 80)
         mode = f"批量复制模式（每批{BATCH_SIZE}个文件）" if USE_BATCH_COPY else "逐个文件处理模式"
         print(f"  处理模式: {mode}")
+        print(f"  数据集类型: {self.dataset}")
         
         overall_start = time.time()
         
@@ -599,11 +675,13 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="JSONL批量更新器")
-    parser.add_argument("--machine", default="machine0", choices=list(MACHINE_DB_MAP.keys()), 
-                        help="目标机器 (默认: machine0)")
+    parser.add_argument("--machine", required=True, choices=list(MACHINE_DB_MAP.keys()), 
+                        help="目标机器（必需）")
+    parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS,
+                        help="数据集类型（必需）")
     args = parser.parse_args()
     
     # 配置参数见文件顶部配置区
-    updater = JSONLBatchUpdater(machine_id=args.machine)
+    updater = JSONLBatchUpdater(machine_id=args.machine, dataset=args.dataset)
     updater.run()
 
