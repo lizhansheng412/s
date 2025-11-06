@@ -18,7 +18,7 @@ from db_config import get_db_config
 from init_temp_table import GZ_LOG_TABLE
 
 FAILED_LOG_BASE = Path(__file__).parent.parent / "logs" / "batch_update"
-DISK_THRESHOLD_GB = 30  # 磁盘空间阈值
+DISK_THRESHOLD_GB = 50  # 磁盘空间阈值
 CHECK_INTERVAL_SEC = 900  # 检查间隔（15分钟）
 
 

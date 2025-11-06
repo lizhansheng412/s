@@ -29,7 +29,7 @@ except ImportError:
 FINAL_DELIVERY_DIR = Path("E:/final_delivery")  # JSONL文件目录
 LOCAL_TEMP_DIR = Path("D:/jsonl_copy")           # 本地SSD缓存目录
 LOG_DIR = Path(__file__).parent.parent / "logs" / "batch_update"
-DEBUG_LOG = Path(__file__).parent.parent / "debug.log"
+RUNNING_LOG = Path(__file__).parent.parent / "logs" / "running.log"
 
 # 处理模式配置
 BATCH_SIZE = 30          # 批量模式：每批处理的文件数（建议10-50）
@@ -49,11 +49,11 @@ if not HAS_WIN32FILE:
 
 
 def log_performance(stage, **metrics):
-    """记录性能日志到debug.log"""
+    """记录性能日志到running.log"""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     metrics_str = " | ".join([f"{k}={v}" for k, v in metrics.items()])
     log_line = f"[{timestamp}] {stage} | {metrics_str}\n"
-    with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+    with open(RUNNING_LOG, 'a', encoding='utf-8') as f:
         f.write(log_line)
 
 

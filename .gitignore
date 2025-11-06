@@ -42,5 +42,5 @@ htmlcov/
 
 # 临时文件和日志
 temp_file_list.txt
-debug.log
+running.log
 failed_corposid

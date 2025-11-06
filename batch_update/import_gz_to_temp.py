@@ -17,6 +17,7 @@ import time
 import threading
 from db_config import get_db_config, MACHINE_DB_MAP
 from init_temp_table import GZ_LOG_TABLE, DATASET_TYPES
+from cleanup_imported_gz import DISK_THRESHOLD_GB
 
 TEMP_TABLE = "temp_import"
 CHUNK_SIZE = 60000  # 单文件一次COPY（54000行+余量，确保任何文件都一次完成）
@@ -24,7 +25,7 @@ COPY_SQL = (
     f"COPY {TEMP_TABLE} (corpusid, data, is_done) "
     "FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '')"
 )
-DEBUG_LOG = Path(__file__).parent.parent / "debug.log"
+RUNNING_LOG = Path(__file__).parent.parent / "logs" / "running.log"
 FAILED_LOG_BASE = Path(__file__).parent.parent / "logs" / "batch_update"
 
 
@@ -34,11 +35,11 @@ def get_failed_log_path(data_type):
 
 
 def log_performance(stage, **metrics):
-    """记录性能日志到debug.log"""
+    """记录性能日志到running.log"""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     metrics_str = " | ".join([f"{k}={v}" for k, v in metrics.items()])
     log_line = f"[{timestamp}] {stage} | {metrics_str}\n"
-    with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+    with open(RUNNING_LOG, 'a', encoding='utf-8') as f:
         f.write(log_line)
 
 
@@ -152,7 +153,7 @@ def start_cleanup_monitor(gz_directory, data_type, machine_id):
         )
         monitor_thread.start()
         
-        print(f"已启动磁盘空间监控 (阈值: 20GB, 间隔: 15分钟)")
+        print(f"已启动磁盘空间监控 (阈值: {DISK_THRESHOLD_GB}GB, 间隔: 15分钟)")
     except Exception as e:
         print(f"WARNING: Failed to start cleanup monitor - {e}")
 
@@ -240,27 +241,41 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
                         if corpusid is None:
                             continue
 
-                        # 支持两种格式：优先使用 content，否则组合 body + bibliography
-                        content_obj = data.get('content')
-                        if content_obj is None:
-                            # 针对 s2orc 和 s2orc_v2：构建 content 对象
-                            if data_type in ('s2orc', 's2orc_v2'):
-                                content_obj = {}
+                        # 根据数据集类型提取不同的字段
+                        data_to_store = None
+                        
+                        if data_type in ('s2orc', 's2orc_v2'):
+                            # s2orc / s2orc_v2：优先使用 content，否则组合 body + bibliography
+                            data_to_store = data.get('content')
+                            if data_to_store is None:
+                                data_to_store = {}
                                 if 'body' in data:
-                                    content_obj['body'] = data['body']
+                                    data_to_store['body'] = data['body']
                                 if 'bibliography' in data:
-                                    content_obj['bibliography'] = data['bibliography']
+                                    data_to_store['bibliography'] = data['bibliography']
                                 
                                 # 如果既没有 body 也没有 bibliography，跳过该记录
-                                if not content_obj:
+                                if not data_to_store:
                                     continue
+                        
+                        elif data_type in ('embeddings_specter_v1', 'embeddings_specter_v2'):
+                            # embeddings：直接提取 vector 字段
+                            if 'vector' in data:
+                                data_to_store = data['vector']
                             else:
-                                # 其他数据集必须有 content 字段
                                 continue
+                        
+                        elif data_type == 'citations':
+                            # citations：暂不处理
+                            continue
+                        
+                        else:
+                            # 未知数据集类型
+                            continue
 
-                        field_json = orjson.dumps(field_obj).decode('utf-8')
+                        content_json = orjson.dumps(data_to_store).decode('utf-8')
                         # TEXT格式：手动转义特殊字符
-                        escaped = field_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                        escaped = content_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                         row = f"{corpusid}\t{escaped}\tf\n"
                         total_count += 1
                         yield row.encode('utf-8')
@@ -448,27 +463,41 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
                             if corpusid is None:
                                 continue
 
-                            # 支持两种格式：优先使用 content，否则组合 body + bibliography
-                            content_obj = data.get('content')
-                            if content_obj is None:
-                                # 针对 s2orc 和 s2orc_v2：构建 content 对象
-                                if data_type in ('s2orc', 's2orc_v2'):
-                                    content_obj = {}
+                            # 根据数据集类型提取不同的字段
+                            data_to_store = None
+                            
+                            if data_type in ('s2orc', 's2orc_v2'):
+                                # s2orc / s2orc_v2：优先使用 content，否则组合 body + bibliography
+                                data_to_store = data.get('content')
+                                if data_to_store is None:
+                                    data_to_store = {}
                                     if 'body' in data:
-                                        content_obj['body'] = data['body']
+                                        data_to_store['body'] = data['body']
                                     if 'bibliography' in data:
-                                        content_obj['bibliography'] = data['bibliography']
+                                        data_to_store['bibliography'] = data['bibliography']
                                     
                                     # 如果既没有 body 也没有 bibliography，跳过该记录
-                                    if not content_obj:
+                                    if not data_to_store:
                                         continue
+                            
+                            elif data_type in ('embeddings_specter_v1', 'embeddings_specter_v2'):
+                                # embeddings：直接提取 vector 字段
+                                if 'vector' in data:
+                                    data_to_store = data['vector']
                                 else:
-                                    # 其他数据集必须有 content 字段
                                     continue
+                            
+                            elif data_type == 'citations':
+                                # citations：暂不处理
+                                continue
+                            
+                            else:
+                                # 未知数据集类型
+                                continue
 
-                            field_json = orjson.dumps(field_obj).decode('utf-8')
+                            content_json = orjson.dumps(data_to_store).decode('utf-8')
                             # TEXT格式：手动转义特殊字符
-                            escaped = field_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                            escaped = content_json.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                             row = f"{corpusid}\t{escaped}\tf\n"
                             file_count += 1
                             yield row.encode('utf-8')
