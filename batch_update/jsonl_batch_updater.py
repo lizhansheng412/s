@@ -389,14 +389,14 @@ class JSONLBatchUpdater:
             cursor = self.cursors[self.primary_machine]
             
             cursor.execute(f"""
-                SELECT corpusid, specter_v1, specter_v2, content
+                SELECT corpusid, specter_v1, specter_v2, content, citations, references
                 FROM {TEMP_TABLE}
                 WHERE corpusid = ANY(%s) AND is_done = FALSE;
             """, (corpusid_list_or_tuples,))
             
             # 构造与多机器模式相同的返回格式
             updates_merged = {}
-            for corpusid, specter_v1, specter_v2, content in cursor:
+            for corpusid, specter_v1, specter_v2, content, citations, references in cursor:
                 if corpusid not in updates_merged:
                     updates_merged[corpusid] = {}
                 
@@ -416,6 +416,18 @@ class JSONLBatchUpdater:
                 if content:
                     try:
                         updates_merged[corpusid]['content'] = orjson.loads(content)
+                    except:
+                        pass
+                
+                if citations:
+                    try:
+                        updates_merged[corpusid]['citations'] = orjson.loads(citations)
+                    except:
+                        pass
+                
+                if references:
+                    try:
+                        updates_merged[corpusid]['references'] = orjson.loads(references)
                     except:
                         pass
             
@@ -440,13 +452,13 @@ class JSONLBatchUpdater:
                 
                 # 查询所有字段（只返回非空字段）
                 cursor.execute(f"""
-                    SELECT corpusid, specter_v1, specter_v2, content
+                    SELECT corpusid, specter_v1, specter_v2, content, citations, references
                     FROM {TEMP_TABLE}
                     WHERE corpusid = ANY(%s) AND is_done = FALSE;
                 """, (corpusids,))
                 
                 # Step 3: 合并数据（处理冲突）
-                for corpusid, specter_v1, specter_v2, content in cursor:
+                for corpusid, specter_v1, specter_v2, content, citations, references in cursor:
                     if corpusid not in updates_merged:
                         updates_merged[corpusid] = {}
                     
@@ -473,6 +485,29 @@ class JSONLBatchUpdater:
                         # 如果当前是主机器且有content，覆盖之前的
                         try:
                             updates_merged[corpusid]['content'] = orjson.loads(content)
+                        except:
+                            pass
+                    
+                    # citations和references处理（主机器优先）
+                    if citations and 'citations' not in updates_merged[corpusid]:
+                        try:
+                            updates_merged[corpusid]['citations'] = orjson.loads(citations)
+                        except:
+                            pass
+                    elif citations and machine_id == self.primary_machine:
+                        try:
+                            updates_merged[corpusid]['citations'] = orjson.loads(citations)
+                        except:
+                            pass
+                    
+                    if references and 'references' not in updates_merged[corpusid]:
+                        try:
+                            updates_merged[corpusid]['references'] = orjson.loads(references)
+                        except:
+                            pass
+                    elif references and machine_id == self.primary_machine:
+                        try:
+                            updates_merged[corpusid]['references'] = orjson.loads(references)
                         except:
                             pass
             
@@ -577,6 +612,32 @@ class JSONLBatchUpdater:
             # 只有当原字段为空时才添加
             if not record.get('content') or record.get('content') == {}:
                 record['content'] = merged_data['content']
+                updated = True
+        
+        # ========== 处理 citations 字段 ==========
+        if 'citations' in merged_data:
+            citations_data = merged_data['citations']
+            # 确保citations_data是列表
+            if isinstance(citations_data, list):
+                record['citations'] = citations_data
+                # 构造detailsOfCitations
+                record['detailsOfCitations'] = {
+                    "offset": 0,
+                    "data": citations_data
+                }
+                updated = True
+        
+        # ========== 处理 references 字段 ==========
+        if 'references' in merged_data:
+            references_data = merged_data['references']
+            # 确保references_data是列表
+            if isinstance(references_data, list):
+                record['references'] = references_data
+                # 构造detailsOfReference
+                record['detailsOfReference'] = {
+                    "offset": 0,
+                    "data": references_data
+                }
                 updated = True
         
         return updated
