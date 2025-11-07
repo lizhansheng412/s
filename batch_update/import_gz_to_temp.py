@@ -21,12 +21,31 @@ from cleanup_imported_gz import DISK_THRESHOLD_GB
 
 TEMP_TABLE = "temp_import"
 CHUNK_SIZE = 60000  # 单文件一次COPY（54000行+余量，确保任何文件都一次完成）
-COPY_SQL = (
-    f"COPY {TEMP_TABLE} (corpusid, data, is_done) "
-    "FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '')"
-)
 RUNNING_LOG = Path(__file__).parent.parent / "logs" / "running.log"
 FAILED_LOG_BASE = Path(__file__).parent.parent / "logs" / "batch_update"
+
+
+def get_copy_sql(data_type):
+    """根据数据集类型生成对应的COPY SQL命令"""
+    if data_type == 'embeddings_specter_v1':
+        field = 'specter_v1'
+    elif data_type == 'embeddings_specter_v2':
+        field = 'specter_v2'
+    elif data_type in ('s2orc', 's2orc_v2'):
+        field = 'content'
+    elif data_type == 'citations':
+        # citations 使用两个字段：citations 和 references（references是保留字，需要双引号）
+        return (
+            f'COPY {TEMP_TABLE} (corpusid, citations, "references", is_done) '
+            "FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '')"
+        )
+    else:
+        raise ValueError(f"不支持的数据集类型: {data_type}")
+    
+    return (
+        f"COPY {TEMP_TABLE} (corpusid, {field}, is_done) "
+        "FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '')"
+    )
 
 
 def get_failed_log_path(data_type):
@@ -221,8 +240,8 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
         # 关闭同步提交，提速20-30%（临时数据可接受风险）
         cursor.execute("SET LOCAL synchronous_commit = OFF;")
         
-        # 根据数据集类型决定提取的字段
-        field_name = 'vector' if data_type in ['embeddings_specter_v1', 'embeddings_specter_v2'] else 'content'
+        # 根据数据集类型获取COPY SQL
+        copy_sql = get_copy_sql(data_type)
         
         total_count = 0
 
@@ -287,7 +306,7 @@ def import_gz_to_temp_fast(gz_file_path, data_type=None, machine_id='machine0'):
         print("读取并解析gz文件...")
 
         try:
-            cursor.copy_expert(COPY_SQL, CopyStream(row_iterator()))
+            cursor.copy_expert(copy_sql, CopyStream(row_iterator()))
         except RuntimeError as e:
             print(f"✗ 文件读取失败: {e}")
             print(f"  跳过该文件，继续处理下一个...")
@@ -431,8 +450,8 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
         # 关闭同步提交，提速20-30%
         cursor.execute("SET synchronous_commit = OFF;")
         
-        # 根据数据集类型决定提取的字段
-        field_name = 'vector' if data_type in ['embeddings_specter_v1', 'embeddings_specter_v2'] else 'content'
+        # 根据数据集类型获取COPY SQL
+        copy_sql = get_copy_sql(data_type)
         
         total_imported = 0
         skipped_count = 0
@@ -446,7 +465,7 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
             print(f"\n[{i}/{len(gz_files)}] 处理文件: {filename}")
             
             file_count = 0
- 
+
             try:
                 print("  读取并解析gz文件...")
                 def row_iterator():
@@ -502,7 +521,7 @@ def import_multiple_gz_fast(gz_directory, data_type=None, delete_gz=False, machi
                             file_count += 1
                             yield row.encode('utf-8')
 
-                cursor.copy_expert(COPY_SQL, CopyStream(row_iterator()))
+                cursor.copy_expert(copy_sql, CopyStream(row_iterator()))
 
                 # 记录已成功导入的文件
                 log_imported_file(cursor, filename, data_type)

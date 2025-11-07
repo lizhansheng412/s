@@ -30,7 +30,7 @@ TEMP_TABLE = "temp_import"
 # gz文件导入记录表
 GZ_LOG_TABLE = "gz_import_log"
 # 数据集类型枚举
-DATASET_TYPES = ['s2orc', 'embeddings_specter_v1', 'embeddings_specter_v2', 'citations']
+DATASET_TYPES = ['s2orc', 's2orc_v2', 'embeddings_specter_v1', 'embeddings_specter_v2', 'citations']
 
 
 def init_temp_table(machine_id='machine0'):
@@ -39,7 +39,11 @@ def init_temp_table(machine_id='machine0'):
     
     表结构：
     - corpusid: BIGINT (无主键，无索引，提高插入速度)
-    - data: TEXT, 存储需要更新的字段值
+    - specter_v1: TEXT, 存储 embeddings_specter_v1 数据集的字段值
+    - specter_v2: TEXT, 存储 embeddings_specter_v2 数据集的字段值
+    - content: TEXT, 存储 s2orc 和 s2orc_v2 数据集的字段值
+    - citations: TEXT, 存储 citations 数据集的引用字段值
+    - references: TEXT, 存储 citations 数据集的参考字段值
     - is_done: BOOLEAN, 标记是否已处理完成
     
     使用UNLOGGED表提高性能（不写WAL日志）
@@ -58,7 +62,11 @@ def init_temp_table(machine_id='machine0'):
         create_table_sql = f"""
         CREATE UNLOGGED TABLE IF NOT EXISTS {TEMP_TABLE} (
             corpusid BIGINT NOT NULL,
-            data TEXT,
+            specter_v1 TEXT,
+            specter_v2 TEXT,
+            content TEXT,
+            citations TEXT,
+            "references" TEXT,
             is_done BOOLEAN DEFAULT FALSE
         );
         """
