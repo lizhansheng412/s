@@ -1,11 +1,11 @@
 """
-JSONL批量更新器 V3 - 直接生成新JSONL文件
-简化逻辑：
-1. 从Machine0的corpusid_to_file表获取文件列表（已分组，每文件≤50000个corpusid）
-2. 本地查询Machine0的citations/references数据（无需局域网）
-3. 直接生成新JSONL文件到E:\copy_final目录
-4. 仅包含5个字段：corpusid, citations, references, detailsOfCitations, detailsOfReference
-5. 跳过没有citations和references的corpusid
+JSONL批量更新器 V4 - 使用UNNEST + WITH ORDINALITY优化title查询
+优化点：
+1. 使用 UNNEST($1::int[]) WITH ORDINALITY 替代 WHERE corpusid = ANY(%s)
+2. LEFT JOIN 确保所有ID都返回（缺失title为NULL）
+3. ORDER BY ord 保持输入顺序
+4. 计划稳定（嵌套循环+索引点查），避免计划波动
+5. 其他逻辑与V3完全相同
 """
 import sys
 from pathlib import Path
@@ -22,7 +22,7 @@ import time
 from db_config import get_db_config
 
 # ==================== 配置区 ====================
-COPY_FINAL_DIR = Path("E:/copy_final_1")      # 新JSONL输出目录
+COPY_FINAL_DIR = Path("E:/copy_final")      # 新JSONL输出目录
 RUNNING_LOG = Path(__file__).parent.parent / "logs" / "running.log"
 
 TITLE_BATCH_SIZE = 100000                   # title查询批次大小
@@ -30,7 +30,7 @@ OUTPUT_SUFFIX = "_part2.jsonl"              # 输出文件后缀
 
 # 初始化
 COPY_FINAL_DIR.mkdir(parents=True, exist_ok=True)
-FAILED_LOG = COPY_FINAL_DIR / f"jsonl_v3_failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+FAILED_LOG = COPY_FINAL_DIR / f"jsonl_v4_failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 # ==================================================
 
 
@@ -43,27 +43,25 @@ def log_performance(stage, **metrics):
         f.write(log_line)
 
 
-class JSONLBatchUpdaterV3:
-    """JSONL批量更新器V3 - 直接生成新文件"""
+class JSONLBatchUpdaterV4:
+    """JSONL批量更新器V4 - 使用UNNEST优化title查询"""
     
-    def __init__(self, machine_id='machine0', skip_title=False):
+    def __init__(self, machine_id='machine0'):
         """
         初始化更新器
         
         Args:
             machine_id: 目标机器（提供corpusid_to_file表和citations/references数据） - 默认machine0
-            skip_title: 是否跳过title查询（True=仅使用corpusid列表，False=查询title并构造对象） - 默认False
         """
         self.machine_id = machine_id
-        self.skip_title = skip_title
         self.conn = None
         self.cursor = None
         self.failed_files = []
         
-        print(f"初始化更新器V3:")
+        print(f"初始化更新器V4 (UNNEST优化):")
         print(f"  目标机器: {machine_id} (本地查询)")
         print(f"  输出目录: {COPY_FINAL_DIR}")
-        print(f"  Title模式: {'禁用（仅corpusid列表）' if skip_title else '启用（查询title构造对象）'}")
+        print(f"  优化方案: UNNEST + WITH ORDINALITY + LEFT JOIN")
     
     def connect_db(self):
         """连接数据库"""
@@ -127,8 +125,35 @@ class JSONLBatchUpdaterV3:
         
         return grouped, total_count
     
+    def query_titles_with_unnest(self, id_list):
+        """使用UNNEST + WITH ORDINALITY查询title（V4核心优化）
+        
+        Args:
+            id_list: corpusid列表
+        
+        Returns:
+            dict: {corpusid: title}，缺失的title为空字符串
+        """
+        if not id_list:
+            return {}
+        
+        cursor = self.cursor
+        
+        # 核心SQL：使用UNNEST + WITH ORDINALITY + LEFT JOIN
+        cursor.execute("""
+            SELECT v.id, COALESCE(t.title, '') as title
+            FROM unnest(%s::int[]) WITH ORDINALITY AS v(id, ord)
+            LEFT JOIN corpusid_mapping_title t ON t.corpusid = v.id
+            ORDER BY v.ord
+        """, (id_list,))
+        
+        # 构造字典（保持顺序）
+        title_map = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        return title_map
+    
     def query_citations_from_machine0(self, corpusid_list, filename):
-        """从Machine0查询citations/references数据（本地查询）
+        """从Machine0查询citations/references数据（使用UNNEST优化title查询）
         
         Args:
             corpusid_list: corpusid列表（已排序）
@@ -165,102 +190,72 @@ class JSONLBatchUpdaterV3:
         cite_data = {row[0]: row[1] for row in cursor.fetchall()}
         t_cite = time.time() - t2
         
-        # 步骤3-5: 根据skip_title参数决定处理方式
-        if self.skip_title:
-            # 快速模式：直接使用corpusid列表，不查询title
-            t_title = 0
-            title_batches = 0
-            all_ids = set()
+        # 步骤3: 收集所有需要查询title的corpusid
+        all_ids = set()
+        for ref_ids in ref_data.values():
+            if ref_ids:
+                all_ids.update(ref_ids)
+        for cite_ids in cite_data.values():
+            if cite_ids:
+                all_ids.update(cite_ids)
+        
+        # 步骤4: 使用UNNEST分批查询title（V4优化点）
+        t3 = time.time()
+        title_map = {}
+        title_batches = 0
+        
+        if all_ids:
+            all_ids_list = list(all_ids)
             
-            t4 = time.time()
-            result = {}
+            for i in range(0, len(all_ids_list), TITLE_BATCH_SIZE):
+                batch_ids = all_ids_list[i:i+TITLE_BATCH_SIZE]
+                title_batches += 1
+                
+                # 使用UNNEST + WITH ORDINALITY替代ANY
+                batch_titles = self.query_titles_with_unnest(batch_ids)
+                title_map.update(batch_titles)
+        
+        t_title = time.time() - t3
+        
+        # 步骤5: 构造最终结果（JSON格式）
+        t4 = time.time()
+        result = {}
+        
+        # 遍历所有corpusid
+        for corpusid in corpusid_list:
+            ref_ids = ref_data.get(corpusid, [])
+            cite_ids = cite_data.get(corpusid, [])
             
-            # 遍历所有corpusid
-            for corpusid in corpusid_list:
-                ref_ids = ref_data.get(corpusid, [])
-                cite_ids = cite_data.get(corpusid, [])
-                
-                # 跳过没有citations和references的corpusid
-                if not ref_ids and not cite_ids:
-                    continue
-                
-                result[corpusid] = {}
-                
-                # 直接使用corpusid列表（不含title）
-                result[corpusid]['references'] = list(ref_ids) if ref_ids else []
-                result[corpusid]['citations'] = list(cite_ids) if cite_ids else []
+            # 跳过没有citations和references的corpusid
+            if not ref_ids and not cite_ids:
+                continue
             
-            t_build = time.time() - t4
-        else:
-            # 完整模式：查询title并构造对象
-            # 步骤3: 收集所有需要查询title的corpusid
-            all_ids = set()
-            for ref_ids in ref_data.values():
-                if ref_ids:
-                    all_ids.update(ref_ids)
-            for cite_ids in cite_data.values():
-                if cite_ids:
-                    all_ids.update(cite_ids)
+            result[corpusid] = {}
             
-            # 步骤4: 分批查询title（避免IN子句过大）
-            t3 = time.time()
-            title_map = {}
-            title_batches = 0
-            if all_ids:
-                all_ids_list = list(all_ids)
-                
-                for i in range(0, len(all_ids_list), TITLE_BATCH_SIZE):
-                    batch_ids = all_ids_list[i:i+TITLE_BATCH_SIZE]
-                    title_batches += 1
-                    
-                    cursor.execute("""
-                        SELECT corpusid, COALESCE(title, '') as title
-                        FROM corpusid_mapping_title
-                        WHERE corpusid = ANY(%s)
-                    """, (batch_ids,))
-                    
-                    title_map.update({row[0]: row[1] for row in cursor.fetchall()})
-            t_title = time.time() - t3
+            # 构造references
+            if ref_ids:
+                result[corpusid]['references'] = [
+                    {"corpusid": rid, "title": title_map.get(rid, "")}
+                    for rid in ref_ids
+                ]
+            else:
+                result[corpusid]['references'] = []
             
-            # 步骤5: 构造最终结果（JSON格式）
-            t4 = time.time()
-            result = {}
-            
-            # 遍历所有corpusid
-            for corpusid in corpusid_list:
-                ref_ids = ref_data.get(corpusid, [])
-                cite_ids = cite_data.get(corpusid, [])
-                
-                # 跳过没有citations和references的corpusid
-                if not ref_ids and not cite_ids:
-                    continue
-                
-                result[corpusid] = {}
-                
-                # 构造references（含title）
-                if ref_ids:
-                    result[corpusid]['references'] = [
-                        {"corpusid": rid, "title": title_map.get(rid, "")}
-                        for rid in ref_ids
-                    ]
-                else:
-                    result[corpusid]['references'] = []
-                
-                # 构造citations（含title）
-                if cite_ids:
-                    result[corpusid]['citations'] = [
-                        {"corpusid": cid, "title": title_map.get(cid, "")}
-                        for cid in cite_ids
-                    ]
-                else:
-                    result[corpusid]['citations'] = []
-            
-            t_build = time.time() - t4
+            # 构造citations
+            if cite_ids:
+                result[corpusid]['citations'] = [
+                    {"corpusid": cid, "title": title_map.get(cid, "")}
+                    for cid in cite_ids
+                ]
+            else:
+                result[corpusid]['citations'] = []
+        
+        t_build = time.time() - t4
         
         # 统计并记录耗时
         total_time = time.time() - query_start
         log_performance(
-            "Machine0查询",
+            "Machine0查询(V4-UNNEST)",
             file=filename,
             input_corpusids=len(corpusid_list),
             ref_count=len(ref_data),
@@ -348,7 +343,7 @@ class JSONLBatchUpdaterV3:
     def run(self):
         """执行完整更新流程"""
         print("=" * 80)
-        print("JSONL批量更新器 V3 - 直接生成新文件")
+        print("JSONL批量更新器 V4 - UNNEST优化版")
         print("=" * 80)
         
         overall_start = time.time()
@@ -376,7 +371,7 @@ class JSONLBatchUpdaterV3:
                     file_start = time.time()
                     
                     try:
-                        # 步骤1: 从Machine0查询citations/references
+                        # 步骤1: 从Machine0查询citations/references（使用UNNEST优化）
                         machine0_data = self.query_citations_from_machine0(
                             corpusid_list, filename
                         )
@@ -432,7 +427,7 @@ class JSONLBatchUpdaterV3:
                 print(f"\n详细信息已保存到: {FAILED_LOG}")
             
             log_performance(
-                "V3完成",
+                "V4完成(UNNEST)",
                 files=f"{processed_files}/{len(grouped_files)}",
                 input_corpusids=f"{total_corpusids:,}",
                 written=f"{total_written:,}",
@@ -452,35 +447,45 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="JSONL批量更新器 V3 - 直接生成新JSONL文件",
+        description="JSONL批量更新器 V4 - 使用UNNEST优化title查询",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 默认配置（使用machine0本地数据，查询title）
-  python batch_update/jsonl_batch_updater_v3.py
-  
-  # 快速模式（跳过title查询，仅使用corpusid列表）
-  python batch_update/jsonl_batch_updater_v3.py --skip-title
+  # 默认配置（使用machine0本地数据）
+  python batch_update/jsonl_batch_updater_v4.py
   
   # 指定其他机器
-  python batch_update/jsonl_batch_updater_v3.py --machine machine0
+  python batch_update/jsonl_batch_updater_v4.py --machine machine0
 
 工作流程:
   1. 从Machine0的corpusid_to_file表查询所有文件（按文件分组）
   2. 逐个处理文件：
      - 本地查询该文件所有corpusid的citations/references
-     - 分批查询title（每批100000个）
+     - 使用UNNEST + WITH ORDINALITY分批查询title（每批100000个）
      - 构造JSONL记录（仅5个字段）
      - 跳过没有citations和references的corpusid
      - 写入新文件到E:/copy_final目录
   3. 显示统计结果
+
+V4优化点（相比V3）:
+  1. 使用 UNNEST($1::int[]) WITH ORDINALITY 替代 WHERE corpusid = ANY(%s)
+  2. LEFT JOIN 确保所有ID都返回结果（缺失title为空字符串）
+  3. ORDER BY ord 保持与输入相同的顺序
+  4. 查询计划更稳定（嵌套循环+索引点查），避免ANY方案的计划波动
+  5. 适合索引良好且缓存命中率高的场景
+
+SQL对比:
+  V3: SELECT corpusid, COALESCE(title, '') FROM kv WHERE corpusid = ANY(%s)
+  V4: SELECT v.id, COALESCE(t.title, '') 
+      FROM unnest(%s::int[]) WITH ORDINALITY AS v(id, ord)
+      LEFT JOIN kv t ON t.corpusid = v.id
+      ORDER BY v.ord
 
 输出文件命名规则:
   输入: 6996f911.jsonl
   输出: E:/copy_final/6996f911_part2.jsonl
 
 JSONL记录结构（仅5个字段）:
-  # 默认模式（含title）:
   {
     "corpusid": 12345,
     "citations": [{"corpusid": 100, "title": "..."}],
@@ -488,38 +493,25 @@ JSONL记录结构（仅5个字段）:
     "references": [{"corpusid": 200, "title": "..."}],
     "detailsOfReference": {"offset": 0, "data": [...]}
   }
-  
-  # 快速模式（--skip-title，仅corpusid列表）:
-  {
-    "corpusid": 12345,
-    "citations": [100, 200, 300],
-    "detailsOfCitations": {"offset": 0, "data": [100, 200, 300]},
-    "references": [400, 500],
-    "detailsOfReference": {"offset": 0, "data": [400, 500]}
-  }
 
 注意事项:
   - 每个文件包含最多50000个corpusid（已在corpusid_to_file表中分组）
   - 跳过没有citations和references的corpusid
   - 不修改原文件，直接生成新文件
   - 本地查询，无需局域网
+  - 建议先测试小批量数据对比V3和V4性能差异
         """
     )
     
     parser.add_argument("--machine", default="machine0", 
                         help="目标机器（默认: machine0）")
-    parser.add_argument("--skip-title", action="store_true",
-                        help="跳过title查询，仅使用corpusid列表（快速模式）")
     
     args = parser.parse_args()
     
-    print(f"启动JSONL批量更新器V3")
+    print(f"启动JSONL批量更新器V4 (UNNEST优化版)")
     print(f"  目标机器: {args.machine}")
-    print(f"  快速模式: {'是（跳过title）' if args.skip_title else '否（查询title）'}")
     
-    updater = JSONLBatchUpdaterV3(
-        machine_id=args.machine,
-        skip_title=args.skip_title
-    )
+    updater = JSONLBatchUpdaterV4(machine_id=args.machine)
     updater.run()
+
 

@@ -274,13 +274,16 @@ class JSONLBatchUpdater:
             # 单机器模式（向后兼容）
             cursor = self.cursors[self.primary_machine]
             
+            # 修改：添加 content 字段查询，并按 content 是否为空排序（非空优先）
             cursor.execute(f"""
                 SELECT 
                     m.batch_filename,
-                    t.corpusid
+                    t.corpusid,
+                    CASE WHEN t.content IS NOT NULL AND t.content != '' THEN 0 ELSE 1 END as has_content_priority
                 FROM {TEMP_TABLE} t
                 INNER JOIN corpusid_to_file m ON t.corpusid = m.corpusid
-                WHERE t.is_done = FALSE;
+                WHERE t.is_done = FALSE
+                ORDER BY has_content_priority ASC;
             """)
             
             sql_time = time.time() - sql_start
@@ -290,7 +293,7 @@ class JSONLBatchUpdater:
             grouped = defaultdict(list)
             total_count = 0
             
-            for batch_filename, corpusid in cursor:
+            for batch_filename, corpusid, has_content_priority in cursor:
                 grouped[batch_filename].append(corpusid)
                 total_count += 1
             
