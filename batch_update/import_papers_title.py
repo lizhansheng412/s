@@ -22,6 +22,7 @@ sys.path.insert(0, str(project_root))
 import gzip
 import orjson
 import psycopg2
+from psycopg2 import errors
 from datetime import datetime
 import time
 from tqdm import tqdm
@@ -145,43 +146,77 @@ def import_papers_gz(gz_directory, cursor, conn):
     cursor.execute("SET synchronous_commit = OFF")
     cursor.execute("SET work_mem = '512MB'")
     
-    # 创建临时表用于批量导入
-    cursor.execute(f"""
-        CREATE TEMP TABLE temp_papers (
-            corpusid BIGINT,
-            title TEXT
-        ) ON COMMIT DROP
-    """)
+    def ensure_temp_table():
+        """确保临时表存在，如果不存在则创建"""
+        # 使用DO块来安全地检查并创建临时表（不会导致事务失败）
+        cursor.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname LIKE 'pg_temp%' 
+                    AND c.relname = 'temp_papers'
+                ) THEN
+                    CREATE TEMP TABLE temp_papers (
+                        corpusid BIGINT,
+                        title TEXT
+                    ) ON COMMIT PRESERVE ROWS;
+                END IF;
+            END $$;
+        """)
+    
+    # 创建临时表
+    ensure_temp_table()
     
     copy_sql = "COPY temp_papers (corpusid, title) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '')"
     
     total_records = 0
     total_inserted = 0
+    skipped_count = 0
     start_time = time.time()
     
     with tqdm(gz_files, desc="  导入进度", unit="file") as pbar:
         for gz_file in pbar:
+            # 每次循环前检查文件是否已导入（断点续传检查）
+            # 这样可以避免在多进程/多实例运行时重复处理文件
+            cursor.execute(f"SELECT EXISTS (SELECT 1 FROM {LOG_TABLE} WHERE filename = %s)", (gz_file.name,))
+            if cursor.fetchone()[0]:
+                # 文件已导入，跳过
+                skipped_count += 1
+                pbar.set_postfix_str(f"跳过: {gz_file.name[:30]}... (已导入)")
+                continue
+            
             file_start = time.time()
             file_count = 0
             
+            # 确保临时表存在（每次循环前检查，因为回滚可能删除它）
+            ensure_temp_table()
+            
             def row_iterator():
                 nonlocal file_count
-                with gzip.open(gz_file, 'rt', encoding='utf-8', errors='replace') as f:
-                    for line in f:
-                        try:
-                            data = orjson.loads(line.strip())
-                            corpusid = data.get('corpusid')
-                            title = data.get('title', '')
-                            
-                            if corpusid is not None:
-                                file_count += 1
-                                # 转义特殊字符
-                                if title is None:
-                                    title = ''
-                                title_escaped = str(title).replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                                yield f"{corpusid}\t{title_escaped}\n".encode('utf-8')
-                        except Exception:
-                            continue
+                try:
+                    # 先检查文件是否是有效的gzip文件
+                    with gzip.open(gz_file, 'rt', encoding='utf-8', errors='replace') as f:
+                        for line in f:
+                            try:
+                                data = orjson.loads(line.strip())
+                                corpusid = data.get('corpusid')
+                                title = data.get('title', '')
+                                
+                                if corpusid is not None:
+                                    file_count += 1
+                                    # 转义特殊字符
+                                    if title is None:
+                                        title = ''
+                                    title_escaped = str(title).replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                                    yield f"{corpusid}\t{title_escaped}\n".encode('utf-8')
+                            except Exception:
+                                continue
+                except gzip.BadGzipFile as e:
+                    raise ValueError(f"文件不是有效的gzip格式: {e}")
+                except Exception as e:
+                    raise ValueError(f"读取gzip文件失败: {e}")
             
             try:
                 # 先导入到临时表
@@ -213,6 +248,8 @@ def import_papers_gz(gz_directory, cursor, conn):
             except Exception as e:
                 print(f"\n  ✗ 文件 {gz_file.name} 导入失败: {e}")
                 conn.rollback()
+                # 回滚后确保临时表仍然存在（如果不存在则重新创建）
+                ensure_temp_table()
                 continue
     
     total_time = time.time() - start_time
@@ -221,8 +258,11 @@ def import_papers_gz(gz_directory, cursor, conn):
     print(f"\n【导入完成】")
     print(f"  读取记录: {total_records:,} 条")
     print(f"  插入记录: {total_inserted:,} 条")
+    if skipped_count > 0:
+        print(f"  跳过文件: {skipped_count} 个（已导入）")
     print(f"  总耗时: {total_time:.2f} 秒")
-    print(f"  速度: {speed:.0f} 条/秒")
+    if total_time > 0:
+        print(f"  速度: {speed:.0f} 条/秒")
     print(f"  注意: 重复记录将在创建主键时统一删除")
 
 
@@ -272,6 +312,45 @@ def create_index(cursor, conn):
     conn.commit()
 
 
+def run_create_index_only(machine_id='machine0'):
+    """仅创建索引（不导入数据）"""
+    print("=" * 80)
+    print("创建主键索引（corpusid_mapping_title表）")
+    print("=" * 80)
+    print(f"  目标机器: {machine_id}")
+    print("=" * 80)
+    
+    overall_start = time.time()
+    
+    # 连接数据库
+    db_config = get_db_config(machine_id)
+    print(f"\n连接到数据库 [{machine_id}: {db_config['database']}:{db_config['port']}]...")
+    conn = psycopg2.connect(**db_config)
+    cursor = conn.cursor()
+    print("  ✓ 连接成功")
+    
+    try:
+        # 创建索引
+        create_index(cursor, conn)
+        
+        # 总结
+        total_time = time.time() - overall_start
+        print("\n" + "=" * 80)
+        print("【处理完成】")
+        print("=" * 80)
+        print(f"  总耗时: {total_time:.2f}秒")
+        print("=" * 80)
+        
+    except Exception as e:
+        print(f"\n✗ 处理失败: {e}")
+        conn.rollback()
+        raise
+    
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def run_pipeline(gz_directory, machine_id='machine0', skip_index=False):
     """执行完整的papers导入流程"""
     print("=" * 80)
@@ -291,9 +370,10 @@ def run_pipeline(gz_directory, machine_id='machine0', skip_index=False):
     print("  ✓ 连接成功")
     
     try:
-        # 创建表
+        # 创建表（确保表已存在）
         create_tables(cursor)
         conn.commit()
+        print("  ✓ 表创建/检查完成")
         
         # 导入数据
         import_papers_gz(gz_directory, cursor, conn)
@@ -336,24 +416,36 @@ if __name__ == "__main__":
   
   # 跳过索引创建（如果已存在）
   python batch_update/import_papers_title.py D:\\gz_temp\\papers --skip-index
+  
+  # 仅创建索引（不导入数据）
+  python batch_update/import_papers_title.py --create-index-only --machine machine0
 
 注意：
   - 支持断点续传，中断后重新运行会自动跳过已导入文件
   - 预计耗时：30-60分钟（60GB数据）
   - 此脚本应在import_citations.py之前运行
+  - 表会在导入前自动创建，无需手动创建
         """
     )
     
-    parser.add_argument("gz_directory", help="包含papers gz文件的目录")
+    parser.add_argument("gz_directory", nargs="?", help="包含papers gz文件的目录（使用--create-index-only时不需要）")
     parser.add_argument("--machine", default="machine0", help="目标机器 (默认: machine0)")
     parser.add_argument("--skip-index", action="store_true", help="跳过索引创建")
+    parser.add_argument("--create-index-only", action="store_true", help="仅创建索引，不导入数据")
     
     args = parser.parse_args()
     
-    gz_dir = Path(args.gz_directory)
-    if not gz_dir.is_dir():
-        print(f"错误: {args.gz_directory} 不是有效的目录")
-        sys.exit(1)
-    
-    run_pipeline(args.gz_directory, args.machine, args.skip_index)
+    # 如果只创建索引，不需要gz_directory
+    if args.create_index_only:
+        run_create_index_only(args.machine)
+    else:
+        if not args.gz_directory:
+            parser.error("需要提供gz_directory参数，或使用--create-index-only仅创建索引")
+        
+        gz_dir = Path(args.gz_directory)
+        if not gz_dir.is_dir():
+            print(f"错误: {args.gz_directory} 不是有效的目录")
+            sys.exit(1)
+        
+        run_pipeline(args.gz_directory, args.machine, args.skip_index)
 

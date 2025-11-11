@@ -28,14 +28,15 @@ except ImportError:
 
 # ==================== 配置区（在此修改参数）====================
 # 目录配置
-FINAL_DELIVERY_DIR = Path("E:/final_delivery")  # JSONL文件目录
+FINAL_DELIVERY_DIR = Path("F:/final_delivery")  # JSONL文件目录
 LOCAL_TEMP_DIR = Path("D:/jsonl_copy")           # 本地SSD缓存目录
 LOG_DIR = Path(__file__).parent.parent / "logs" / "batch_update"
 RUNNING_LOG = Path(__file__).parent.parent / "logs" / "running.log"
 
 # 处理模式配置
 BATCH_SIZE = 30          # 批量模式：每批处理的文件数（建议10-50）
-USE_BATCH_COPY = False    # True=批量复制模式（快），False=逐个文件处理（慢但稳定）
+USE_BATCH_COPY = False    # True=批量复制模式，False=逐个文件处理（推荐）
+PROCESS_IN_PLACE = False  # False=复制到本地SSD处理（稳定可靠的方案）
 
 # 数据库配置
 TEMP_TABLE = "temp_import"
@@ -45,7 +46,10 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # 秒
 
 # 性能优化配置
-BATCH_MARK_SIZE = 10  # 批量标记is_done的批次大小
+BATCH_MARK_SIZE = 100000  # 批量标记is_done的批次大小（增大以减少数据库提交次数）
+                          # 建议值：100000-1000000，根据数据量调整
+                          # 更大值 = 更少提交 = 更快，但崩溃时丢失更多未提交标记
+                          # 对于6700万记录，500000可以减少到约134次提交
 
 # 初始化
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -148,8 +152,8 @@ class JSONLBatchUpdater:
             self.cursors = {}
         
         self.failed_corpusids = []
-        # 线程池：用于后台复制文件和流水线查询（支持并发copy+query）
-        self.copy_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="Pipeline")
+        # 线程池：用于后台复制文件
+        self.copy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="CopyWorker")
     
     def _connect_single_db(self, machine_id):
         """连接单个数据库（带重试机制）"""
@@ -298,76 +302,100 @@ class JSONLBatchUpdater:
             return grouped, total_count, stats
         
         else:
-            # 多机器模式：分布式并行查询并合并
-            # Step 1: 并行查询每台机器的corpusid
-            def query_machine_corpusids(machine_id):
-                """查询单台机器的corpusid"""
+            # 多机器模式：优化方案 - 使用数据库端 GROUP BY，大幅减少数据传输
+            # 假设：大部分 corpusid 在各机器不重叠（如 machine0 只有 specter_v2，machine2 只有 specter_v1）
+            
+            def query_machine_grouped(machine_id):
+                """在数据库端分组聚合，减少数据传输量"""
                 cursor = self.cursors[machine_id]
-                cursor.execute(f"SELECT corpusid FROM {TEMP_TABLE} WHERE is_done = FALSE;")
-                corpusids = [row[0] for row in cursor.fetchall()]
-                return machine_id, corpusids
-            
-            all_corpusids_with_source = {}  # {corpusid: [machine_ids]}
-            machine_stats = {}
-            
-            # 并行查询所有机器
-            with ThreadPoolExecutor(max_workers=len(self.machine_list)) as executor:
-                futures = {executor.submit(query_machine_corpusids, mid): mid 
-                          for mid in self.machine_list}
                 
-                for future in futures:
-                    machine_id, corpusids = future.result()
-                    machine_stats[machine_id] = len(corpusids)
-                    
-                    for corpusid in corpusids:
-                        if corpusid not in all_corpusids_with_source:
-                            all_corpusids_with_source[corpusid] = []
-                        all_corpusids_with_source[corpusid].append(machine_id)
+                # 使用 GROUP BY 在数据库端聚合，只返回 (filename, array[corpusids])
+                # 这样可以将 4000万行 → 2000个文件，数据量减少 20000 倍！
+                cursor.execute(f"""
+                    SELECT 
+                        m.batch_filename,
+                        array_agg(t.corpusid) as corpusids
+                    FROM {TEMP_TABLE} t
+                    INNER JOIN corpusid_to_file m ON t.corpusid = m.corpusid
+                    WHERE t.is_done = FALSE
+                    GROUP BY m.batch_filename;
+                """)
+                
+                # 快速构造结果（只有几千个文件，而不是4000万条记录）
+                file_corpusids = {}
+                total_records = 0
+                for batch_filename, corpusids in cursor:
+                    file_corpusids[batch_filename] = corpusids
+                    total_records += len(corpusids)
+                
+                return machine_id, file_corpusids, total_records
             
             sql_time = time.time() - sql_start
             
-            # Step 2: 与 corpusid_to_file 关联（在主机器上执行）
+            # 并行查询所有机器（添加进度提示）
+            print(f"  并行查询 {len(self.machine_list)} 台机器（使用数据库端分组优化）...", flush=True)
+            machine_results = {}
+            machine_stats = {}
+            
+            with ThreadPoolExecutor(max_workers=len(self.machine_list)) as executor:
+                futures = {executor.submit(query_machine_grouped, mid): mid 
+                          for mid in self.machine_list}
+                
+                for future in futures:
+                    machine_id, file_corpusids, record_count = future.result()
+                    machine_results[machine_id] = file_corpusids
+                    machine_stats[machine_id] = record_count
+                    print(f"    [{machine_id}] 完成: {record_count:,} 条记录, {len(file_corpusids)} 个文件", flush=True)
+            
+            # 快速合并结果（优化：假设数据基本不重叠，大幅简化逻辑）
             group_start = time.time()
-            primary_cursor = self.cursors[self.primary_machine]
-            
-            all_corpusids = list(all_corpusids_with_source.keys())
-            if not all_corpusids:
-                return {}, 0, {"sql_time": sql_time, "group_time": 0, "machine_stats": machine_stats, "overlap": 0}
-            
-            primary_cursor.execute(f"""
-                SELECT m.batch_filename, m.corpusid
-                FROM corpusid_to_file m
-                WHERE m.corpusid = ANY(%s);
-            """, (all_corpusids,))
-            
-            # 按文件名分组（存储(corpusid, sources)元组）
             grouped = defaultdict(list)
             total_count = 0
+            overlap_files = set()
             
-            for batch_filename, corpusid in primary_cursor:
-                sources = all_corpusids_with_source[corpusid]
-                grouped[batch_filename].append((corpusid, sources))
-                total_count += 1
+            # 直接合并，不检查重复（因为 machine0 只有 specter_v2，machine2 只有 specter_v1）
+            # 如果有重复，在后续处理时自动合并
+            for machine_id, file_corpusids in machine_results.items():
+                for filename, corpusids in file_corpusids.items():
+                    # 检查该文件是否在其他机器上也有（用于统计重叠）
+                    if grouped[filename]:  # 如果已经有数据，说明有重叠
+                        overlap_files.add(filename)
+                    
+                    # 直接添加数据（每个 corpusid 标记来源机器）
+                    for corpusid in corpusids:
+                        grouped[filename].append((corpusid, [machine_id]))
+                        total_count += 1
+            
+            # 如果有重叠文件，需要合并相同 corpusid 的 sources
+            if overlap_files:
+                print(f"  检测到 {len(overlap_files)} 个重叠文件，正在合并 sources...", flush=True)
+                for filename in overlap_files:
+                    # 合并该文件中相同 corpusid 的 sources
+                    corpusid_map = {}  # {corpusid: [sources]}
+                    for corpusid, sources in grouped[filename]:
+                        if corpusid not in corpusid_map:
+                            corpusid_map[corpusid] = []
+                        corpusid_map[corpusid].extend(sources)
+                    
+                    # 重建该文件的数据
+                    grouped[filename] = [(cid, sources) for cid, sources in corpusid_map.items()]
             
             group_time = time.time() - group_start
             
-            # 统计重复corpusid（同时存在于多台机器）
-            overlap_count = sum(1 for sources in all_corpusids_with_source.values() if len(sources) > 1)
-            
             # 记录日志
-            log_performance("分布式SQL查询", 
+            log_performance("分布式SQL查询（数据库端分组）", 
                            time_sec=f"{sql_time:.2f}", 
                            **{f"{mid}_records": cnt for mid, cnt in machine_stats.items()})
-            log_performance("Python分组", 
+            log_performance("Python合并", 
                            time_sec=f"{group_time:.2f}", 
                            files=len(grouped),
-                           overlap=overlap_count)
+                           overlap_files=len(overlap_files))
             
             stats = {
                 "sql_time": sql_time, 
                 "group_time": group_time,
                 "machine_stats": machine_stats,
-                "overlap": overlap_count
+                "overlap": len(overlap_files)  # 只返回数量，不返回文件名列表
             }
             return grouped, total_count, stats
     
@@ -389,7 +417,7 @@ class JSONLBatchUpdater:
             cursor = self.cursors[self.primary_machine]
             
             cursor.execute(f"""
-                SELECT corpusid, specter_v1, specter_v2, content, citations, references
+                SELECT corpusid, specter_v1, specter_v2, content, "citations", "references"
                 FROM {TEMP_TABLE}
                 WHERE corpusid = ANY(%s) AND is_done = FALSE;
             """, (corpusid_list_or_tuples,))
@@ -452,7 +480,7 @@ class JSONLBatchUpdater:
                 
                 # 查询所有字段（只返回非空字段）
                 cursor.execute(f"""
-                    SELECT corpusid, specter_v1, specter_v2, content, citations, references
+                    SELECT corpusid, specter_v1, specter_v2, content, "citations", "references"
                     FROM {TEMP_TABLE}
                     WHERE corpusid = ANY(%s) AND is_done = FALSE;
                 """, (corpusids,))
@@ -644,7 +672,7 @@ class JSONLBatchUpdater:
 
     
     def update_jsonl_file_from_local(self, filename, updates, skip_copy_in=False, skip_copy_out=False, copy_in_time=0):
-        """在本地SSD上更新JSONL文件
+        """更新JSONL文件（支持原地处理或SSD缓存处理）
         
         Args:
             filename: 文件名
@@ -663,11 +691,12 @@ class JSONLBatchUpdater:
         if not updates:
             return (0, [])
         
-        local_cache = LOCAL_TEMP_DIR / filename
-        local_output = LOCAL_TEMP_DIR / f"{filename}.out"
-        
         process_time = 0
         copy_out_time = 0
+        
+        # SSD缓存模式：复制到本地SSD处理
+        local_cache = LOCAL_TEMP_DIR / filename
+        local_output = LOCAL_TEMP_DIR / f"{filename}.out"
         
         # 步骤1: 复制到本地SSD（如果未跳过）
         if not skip_copy_in:
@@ -675,50 +704,51 @@ class JSONLBatchUpdater:
             win32file.CopyFile(str(file_path), str(local_cache), 0)
             copy_in_time = time.time() - t0
         
-        # 步骤2: 在本地SSD上处理文件（使用mmap加速）
+        # 步骤2: 处理文件（优化：一次性读取，减少 I/O 次数）
         t0 = time.time()
         
-        # 使用mmap读取文件（对大文件更高效）
+        # 预编译更新字典的键集合，加速查找
+        updates_keys = set(updates.keys())
+        updated_corpusids = []
+        
+        # 一次性读取整个文件（现代计算机内存足够，比流式读写快得多）
         with open(local_cache, 'rb') as fin:
-            file_size = os.path.getsize(local_cache)
-            if file_size == 0:
-                content = b''
-            else:
-                with mmap.mmap(fin.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
-                    content = mmapped.read()
+            content = fin.read()
         
         # 按行分割
         lines = content.split(b'\n')
         has_trailing_newline = content.endswith(b'\n')
-        
-        updated_corpusids = []
         output_lines = []
         
-        # 批量处理所有行
+        # 批量处理所有行（在内存中，非常快）
         for line in lines:
             if not line:
+                output_lines.append(b'')
                 continue
             
             corpusid = self._extract_corpusid(line)
             
-            if corpusid in updates:
+            if corpusid in updates_keys:
                 # 需要更新
-                record = orjson.loads(line)
-                data = updates[corpusid]
-                
-                # 应用更新
-                if self._apply_update(record, data):
-                    updated_corpusids.append(corpusid)
-                    output_lines.append(orjson.dumps(record))
-                else:
-                    # 跳过更新，保留原样
+                try:
+                    record = orjson.loads(line)
+                    data = updates[corpusid]
+                    
+                    # 应用更新
+                    if self._apply_update(record, data):
+                        updated_corpusids.append(corpusid)
+                        output_lines.append(orjson.dumps(record))
+                    else:
+                        output_lines.append(line)
+                except Exception:
+                    # JSON 解析失败，保留原样
                     output_lines.append(line)
             else:
                 # 不需要更新
                 output_lines.append(line)
         
-        # 一次性写入
-        with open(local_output, 'wb', buffering=16*1024*1024) as fout:
+        # 一次性写入（减少 I/O 次数）
+        with open(local_output, 'wb') as fout:
             fout.write(b'\n'.join(output_lines))
             if has_trailing_newline and output_lines:
                 fout.write(b'\n')
@@ -728,10 +758,9 @@ class JSONLBatchUpdater:
         # 步骤3: 复制回外置盘
         if not skip_copy_out:
             t0 = time.time()
-            temp_file = file_path.with_suffix('.tmp')
-            win32file.CopyFile(str(local_output), str(temp_file), 0)
-            temp_file.replace(file_path)
+            win32file.CopyFile(str(local_output), str(file_path), 0)
             copy_out_time = time.time() - t0
+            # 立即删除本地缓存文件，释放空间
             local_cache.unlink(missing_ok=True)
             local_output.unlink(missing_ok=True)
         
@@ -849,7 +878,7 @@ class JSONLBatchUpdater:
             if self.mode == 'multi':
                 for machine_id, count in stats.get('machine_stats', {}).items():
                     print(f"    - {machine_id}: {count} 条")
-                print(f"    - 重复记录: {stats.get('overlap', 0)} 条")
+                print(f"    - 重叠文件: {stats.get('overlap', 0)} 个")
             print(f"  分组结果: {len(grouped_corpusids)} 个文件")
             print(f"  准备耗时: {prep_time:.2f}秒")
             
@@ -871,9 +900,8 @@ class JSONLBatchUpdater:
                 batch_size = 1
                 total_batches = len(filenames_list)
             
-            # 流水线模式：追踪下一个文件的后台复制和查询任务
+            # 流水线模式：追踪下一个文件的后台复制任务
             next_copy_future = None
-            next_query_future = None
             
             # 批量标记累积器
             pending_marks_single = []  # 单机器模式：[corpusid, ...]
@@ -959,7 +987,7 @@ class JSONLBatchUpdater:
                         # ========== 逐个文件处理模式（流水线并行优化）==========
                         filename = batch_filenames[0]
                         
-                        # === 阶段1：等待/执行当前文件复制 ===
+                        # === 阶段1：文件复制（后台并行）===
                         copy_in_time = 0
                         
                         if batch_idx == 0:
@@ -970,20 +998,25 @@ class JSONLBatchUpdater:
                                 copy_in_time = time.time() - t0
                             except Exception as e:
                                 print(f"\n  ✗ 复制失败 {filename}: {e}")
+                                next_copy_future = None
                                 pbar.update(1)
                                 continue
                         else:
                             # 后续文件：等待后台复制完成
                             t0 = time.time()
                             try:
-                                next_copy_future.result()  # 阻塞等待
+                                if next_copy_future is None:
+                                    # 上一次循环失败，本次需要同步复制
+                                    self.copy_file_to_local_bg(filename)
+                                else:
+                                    next_copy_future.result()  # 阻塞等待
                                 copy_in_time = time.time() - t0
                             except Exception as e:
                                 print(f"\n  ✗ 后台复制失败 {filename}: {e}")
+                                next_copy_future = None
                                 pbar.update(1)
                                 continue
                         
-                        # === 阶段2：启动下一个文件的后台复制 + 处理当前文件 ===
                         # 启动下一个文件的后台复制
                         if batch_idx < total_batches - 1:
                             next_filename = filenames_list[batch_idx + 1]
@@ -991,42 +1024,16 @@ class JSONLBatchUpdater:
                                 self.copy_file_to_local_bg, next_filename
                             )
                         
-                        # === 阶段2.1：获取当前文件的更新数据（流水线查询）===
+                        # === 阶段2：获取当前文件的更新数据（同步查询，因为cursor不是线程安全的）===
                         corpusid_list_or_tuples = grouped_corpusids[filename]
+                        updates = self.get_file_updates(corpusid_list_or_tuples)
                         
-                        if batch_idx == 0:
-                            # 第一个文件：同步查询
-                            updates = self.get_file_updates(corpusid_list_or_tuples)
-                        else:
-                            # 后续文件：等待后台查询完成
-                            try:
-                                updates = next_query_future.result()
-                            except Exception as e:
-                                print(f"\n  ✗ 查询失败 {filename}: {e}")
-                                pbar.update(1)
-                                continue
-                        
-                        # === 阶段2.2：启动下一个文件的后台查询 ===
-                        if batch_idx < total_batches - 1:
-                            next_filename = filenames_list[batch_idx + 1]
-                            next_corpusid_list = grouped_corpusids[next_filename]
-                            next_query_future = self.copy_executor.submit(
-                                self.get_file_updates, next_corpusid_list
-                            )
-                        
-                        # === 阶段3：等待下一个文件复制完成（如果有）===
-                        if next_copy_future:
-                            try:
-                                next_copy_future.result()  # 阻塞等待
-                            except Exception as e:
-                                # 下一个文件复制失败，记录但不影响当前文件
-                                print(f"\n  ⚠️  下一个文件后台复制失败: {e}")
-                        
-                        # === 阶段4：处理并写回当前文件 ===
-                        # 处理文件（已在本地SSD）
+                        # === 阶段3：处理并写回当前文件 ===
                         process_start = time.time()
                         success_count, failed = self.update_jsonl_file_from_local(
-                            filename, updates, skip_copy_in=True, skip_copy_out=False, 
+                            filename, updates, 
+                            skip_copy_in=True,  # 已经在后台复制完成
+                            skip_copy_out=False, 
                             copy_in_time=copy_in_time
                         )
                         process_time = time.time() - process_start
