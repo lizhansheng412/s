@@ -8,6 +8,7 @@
 - `s2orc` / `s2orc_v2` → content字段
 - `embeddings_specter_v1` → specter_v1字段
 - `embeddings_specter_v2` → specter_v2字段
+- `citations` → citations和references字段（使用独立流程）
 
 ---
 
@@ -123,9 +124,65 @@ python batch_update/import_gz_to_temp.py D:\gz_temp\embeddings_v2 --dataset embe
 python batch_update/init_temp_table.py --machine machine2 --create-indexes
 
 # 协同更新（在machine0执行）
-python batch_update/jsonl_batch_updater.py --machines machine0,machine2
+python batch_update/jsonl_batch_updater.py --machines machine2,machine0
 
 # 清空
 python batch_update/init_temp_table.py --machine machine0 --truncate
 python batch_update/init_temp_table.py --machine machine2 --truncate
 ```
+
+---
+
+## Citations数据处理流程（独立流程）
+
+Citations数据处理流程与其他数据集不同，需要单独执行6个阶段：
+
+### 完整流程（推荐分步执行）
+
+```bash
+# 阶段1：导入gz文件到citation_raw表（14亿+条记录，约1-2小时）
+python batch_update/import_citations.py D:\gz_temp\citations --only-import
+
+# 阶段2：创建索引（约30-60分钟）
+python batch_update/import_citations.py D:\gz_temp\citations --only-index
+
+# 阶段3：构造references缓存（约20-30分钟）
+python batch_update/import_citations.py D:\gz_temp\citations --only-stage3
+
+# 阶段4：构造citations缓存（约20-30分钟）
+python batch_update/import_citations.py D:\gz_temp\citations --only-stage4
+
+# 阶段5：批量INSERT数据到temp_import表（约10-20分钟，插入6700万条记录）
+python batch_update/import_citations.py D:\gz_temp\citations --only-stage5
+```
+
+### 快速选项
+
+```bash
+# 跳过已完成的阶段（例如：已完成阶段1-2，直接执行阶段3-5）
+python batch_update/import_citations.py D:\gz_temp\citations --skip-import --skip-index
+
+# 强制重建缓存（数据变化后使用）
+python batch_update/import_citations.py D:\gz_temp\citations --only-stage3 --force-stage3
+python batch_update/import_citations.py D:\gz_temp\citations --only-stage4 --force-stage4
+```
+
+### 注意事项
+
+1. **阶段5直接INSERT**：不需要temp_import表预先有数据，会直接插入约6700万条记录
+2. **极致性能优化**（充分利用32GB内存和8核CPU）：
+   - 批次大小：5万条/批（避免PostgreSQL的VALUES子句1664条目限制）
+   - 复用临时表：使用TRUNCATE代替DROP/CREATE（速度提升100倍）
+   - CTE优化查询：预聚合数据，减少子查询深度
+   - 并行执行：启用4路并行查询，充分利用多核CPU
+   - 批量提交：每5批提交一次，减少事务开销
+   - 高内存配置：work_mem=2GB, 支持大规模哈希聚合
+   - 异步提交：synchronous_commit=OFF，提升10倍写入速度
+3. **性能监控**：每批显示详细耗时（TRUNCATE/COPY/INSERT/COMMIT），便于定位瓶颈
+4. **缓存表可复用**：temp_references和temp_citations除非数据变化，否则不需要重建
+5. **citation_raw表保留**：默认保留，重建需1-2小时
+6. **前置依赖**：确保corpusid_mapping_title表已存在
+7. **执行顺序**：必须按照阶段1→2→3→4→5的顺序执行（可跳过已完成的阶段）
+8. **预期性能**：优化后每批5万条处理时间应在5-15秒，整体速度提升5-10倍
+
+---
