@@ -210,25 +210,28 @@ class JSONLBatchUpdaterV2:
                 }
             }
         """
+        query_start = time.time()
         cursor = self.cursors[self.auxiliary_machine]
         
         # 步骤1: 查询temp_references（获取ref_ids数组）
+        t1 = time.time()
         cursor.execute("""
             SELECT corpusid, ref_ids
             FROM temp_references
             WHERE corpusid >= %s AND corpusid <= %s
         """, (start_corpusid, end_corpusid))
-        
         ref_data = {row[0]: row[1] for row in cursor.fetchall()}
+        t_ref = time.time() - t1
         
         # 步骤2: 查询temp_citations（获取cite_ids数组）
+        t2 = time.time()
         cursor.execute("""
             SELECT corpusid, cite_ids
             FROM temp_citations
             WHERE corpusid >= %s AND corpusid <= %s
         """, (start_corpusid, end_corpusid))
-        
         cite_data = {row[0]: row[1] for row in cursor.fetchall()}
+        t_cite = time.time() - t2
         
         # 步骤3: 收集所有需要查询title的corpusid
         all_ids = set()
@@ -240,12 +243,15 @@ class JSONLBatchUpdaterV2:
                 all_ids.update(cite_ids)
         
         # 步骤4: 分批查询title（避免IN子句过大）
+        t3 = time.time()
         title_map = {}
+        title_batches = 0
         if all_ids:
             all_ids_list = list(all_ids)
             
             for i in range(0, len(all_ids_list), TITLE_BATCH_SIZE):
                 batch_ids = all_ids_list[i:i+TITLE_BATCH_SIZE]
+                title_batches += 1
                 
                 cursor.execute("""
                     SELECT corpusid, COALESCE(title, '') as title
@@ -254,8 +260,10 @@ class JSONLBatchUpdaterV2:
                 """, (batch_ids,))
                 
                 title_map.update({row[0]: row[1] for row in cursor.fetchall()})
+        t_title = time.time() - t3
         
         # 步骤5: 构造最终结果（JSON格式）
+        t4 = time.time()
         result = {}
         
         # 合并所有可能的corpusid（有references或citations的）
@@ -283,6 +291,24 @@ class JSONLBatchUpdaterV2:
                 ]
             else:
                 result[corpusid]['citations'] = []
+        t_build = time.time() - t4
+        
+        # 统计并记录耗时
+        total_time = time.time() - query_start
+        log_performance(
+            "Machine0查询",
+            range=f"[{start_corpusid}, {end_corpusid}]",
+            ref_count=len(ref_data),
+            cite_count=len(cite_data),
+            title_ids=len(all_ids),
+            title_batches=title_batches,
+            result_count=len(result),
+            time_ref=f"{t_ref:.2f}s",
+            time_cite=f"{t_cite:.2f}s",
+            time_title=f"{t_title:.2f}s",
+            time_build=f"{t_build:.2f}s",
+            total_time=f"{total_time:.2f}s"
+        )
         
         return result
     

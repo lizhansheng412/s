@@ -28,7 +28,7 @@ except ImportError:
 
 # ==================== 配置区（在此修改参数）====================
 # 目录配置
-FINAL_DELIVERY_DIR = Path("F:/final_delivery")  # JSONL文件目录
+FINAL_DELIVERY_DIR = Path("E:/final_delivery")  # JSONL文件目录
 LOCAL_TEMP_DIR = Path("D:/jsonl_copy")           # 本地SSD缓存目录
 LOG_DIR = Path(__file__).parent.parent / "logs" / "batch_update"
 RUNNING_LOG = Path(__file__).parent.parent / "logs" / "running.log"

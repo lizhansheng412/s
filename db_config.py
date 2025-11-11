@@ -17,7 +17,7 @@ DB_SHARED_CONFIG = {
 
 # 机器配置映射（数据库、端口、主机）
 MACHINE_DB_MAP = {
-    'machine0': {'host': 'localhost', 'database': 's2orc_d0', 'port': 5430},
+    'machine0': {'host': 'localhost', 'database': 's2orc_d0', 'port': 5430, 'password': '333444'},
     'machine1': {'host': 'localhost', 'database': 's2orc_d1', 'port': 5431},
     'machine2': {'host': '192.168.0.108', 'database': 's2orc_d2', 'port': 5432},  # 局域网机器
     'machine3': {'host': 'localhost', 'database': 's2orc_d3', 'port': 5433},
