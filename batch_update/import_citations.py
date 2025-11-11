@@ -560,11 +560,35 @@ def update_temp_import(cursor, conn):
                 commit_marker = " "
             commit_time = time.time() - commit_start
             
+            # 计算预估剩余时间
+            elapsed_step5 = time.time() - step5_start
+            progress = (total_inserted / unique_count * 100) if unique_count > 0 else 0
+            remaining_count = unique_count - total_inserted
+            avg_rate = total_inserted / elapsed_step5 if elapsed_step5 > 0 else 0
+            eta_seconds = remaining_count / avg_rate if avg_rate > 0 else 0
+            
+            # 格式化ETA
+            if eta_seconds > 3600:
+                eta_str = f"{eta_seconds/3600:.1f}小时"
+            elif eta_seconds > 60:
+                eta_str = f"{eta_seconds/60:.1f}分钟"
+            else:
+                eta_str = f"{eta_seconds:.0f}秒"
+            
             # 每批显示进度
             if batch_num % 5 == 0 or batch_num == 1:
-                progress = (total_inserted / unique_count * 100) if unique_count > 0 else 0
-                print(f"    批次 #{batch_num}{commit_marker}: {inserted:,}条 | {batch_time:.2f}秒 | {rate:.0f}条/秒 | 进度{progress:.1f}%")
+                print(f"    批次 #{batch_num}{commit_marker}: {inserted:,}条 | {batch_time:.2f}秒 | {rate:.0f}条/秒 | 进度{progress:.1f}% | ETA: {eta_str}")
                 print(f"        详细: IN查询({query_time:.2f}s) + Python+COPY({copy_time:.2f}s) + 提交({commit_time:.3f}s)")
+                
+                # 记录到日志文件
+                log_performance(
+                    "阶段5-批次进度",
+                    batch=batch_num,
+                    inserted=f"{total_inserted:,}/{unique_count:,}",
+                    progress=f"{progress:.1f}%",
+                    rate=f"{avg_rate:.0f}条/秒",
+                    eta=eta_str
+                )
         
         except Exception as e:
             error_msg = str(e)[:200]
