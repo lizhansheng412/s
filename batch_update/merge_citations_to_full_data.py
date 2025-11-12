@@ -502,6 +502,32 @@ def main():
             print("❌ 错误: 源目录中没有找到 *_part2.jsonl 文件")
             return
         
+        # 对于 machine2，只处理目标目录中存在对应文件的源文件
+        if args.machine == 'machine2':
+            # 获取目标目录所有文件名（不含后缀）
+            target_files_set = set()
+            for target_file in target_path.glob("*.jsonl"):
+                if not target_file.name.endswith("_part2.jsonl"):
+                    target_files_set.add(target_file.stem)
+            
+            log(LOG_FILE, f"目标目录文件数: {len(target_files_set)}")
+            
+            # 过滤源文件：只保留目标目录中存在对应文件的
+            filtered_source_files = []
+            for source_file in source_files:
+                source_name = source_file.stem  # 例如: "4f694c82_part2"
+                if source_name.endswith("_part2"):
+                    base_name = source_name[:-6]  # 去掉 "_part2"
+                    if base_name in target_files_set:
+                        filtered_source_files.append(source_file)
+            
+            source_files = filtered_source_files
+            log(LOG_FILE, f"匹配的源文件数: {len(source_files)}")
+            
+            if not source_files:
+                print("❌ 错误: 没有找到与目标目录匹配的源文件")
+                return
+        
         # 获取已完成的文件
         completed_files = get_completed_files(PROGRESS_DB)
         

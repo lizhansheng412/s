@@ -194,5 +194,5 @@ python batch_update/merge_citations_to_full_data.py --source-dir "E:\copy_final_
 
 ### 远程数据库
 
-python batch_update/merge_citations_to_full_data.py --source-dir "E:\copy_final_cache" --target-dir "F:\final_delivery_1" --machine machine0
+python batch_update/merge_citations_to_full_data.py --source-dir "G:\1500_part2" --target-dir "G:\final_delivery" --machine machine0
 
