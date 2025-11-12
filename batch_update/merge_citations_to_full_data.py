@@ -36,8 +36,8 @@ CITATION_FIELDS = ["citations", "references", "detailsOfCitations", "detailsOfRe
 DB_FIELDS = ["content"]
 ALL_UPDATE_FIELDS = CITATION_FIELDS + DB_FIELDS
 
-IGNORE_IS_DONE_FILTER = True
-IS_DONE_FILTER_VALUE = 0
+IGNORE_IS_DONE_FILTER = False
+IS_DONE_FILTER_VALUE = False  # PostgreSQL boolean 类型
 
 # 重试配置
 MAX_RETRIES = 5              # 最大重试次数
@@ -260,6 +260,12 @@ def load_db_data(db_conn, corpusid_list: list, db_config: Dict[str, str], log_fi
             return db_data
             
         except (OperationalError, InterfaceError) as e:
+            # 回滚当前事务
+            try:
+                db_conn.rollback()
+            except:
+                pass
+            
             if attempt < MAX_RETRIES:
                 log(log_file, f"数据库查询失败 (尝试 {attempt}/{MAX_RETRIES}): {e}, {RETRY_DELAY}秒后重试...")
                 time.sleep(RETRY_DELAY)
@@ -271,6 +277,14 @@ def load_db_data(db_conn, corpusid_list: list, db_config: Dict[str, str], log_fi
             else:
                 log(log_file, f"数据库查询最终失败: {e}")
                 raise e
+        except Exception as e:
+            # 其他错误也需要回滚
+            try:
+                db_conn.rollback()
+            except:
+                pass
+            log(log_file, f"数据库查询错误: {e}")
+            raise e
 
 
 def process_file_pair(source_file: Path, target_file: Path, 
