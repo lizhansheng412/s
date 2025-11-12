@@ -208,7 +208,7 @@ def load_db_data(db_conn, corpusid_list: list, db_config: Dict[str, str], log_fi
     从数据库批量加载数据(带重试和连接恢复)
     
     Returns:
-        {corpusid: {specter_v1, specter_v2, content}}
+        {corpusid: {content}}
     """
     if not corpusid_list:
         return {}
@@ -227,14 +227,14 @@ def load_db_data(db_conn, corpusid_list: list, db_config: Dict[str, str], log_fi
             
             if IGNORE_IS_DONE_FILTER:
                 query = f"""
-                    SELECT corpusid, specter_v1, specter_v2, content
+                    SELECT corpusid, content
                     FROM temp_import
                     WHERE corpusid IN ({placeholders})
                 """
                 params = corpusid_list
             else:
                 query = f"""
-                    SELECT corpusid, specter_v1, specter_v2, content
+                    SELECT corpusid, content
                     FROM temp_import
                     WHERE is_done = %s AND corpusid IN ({placeholders})
                 """
@@ -244,15 +244,13 @@ def load_db_data(db_conn, corpusid_list: list, db_config: Dict[str, str], log_fi
             
             db_data = {}
             for row in cursor.fetchall():
-                corpusid, specter_v1, specter_v2, content = row
+                corpusid, content = row
                 
-                # 跳过三个字段全为空的记录
-                if not any([specter_v1, specter_v2, content]):
+                # 跳过 content 为空的记录
+                if not content:
                     continue
                 
                 db_data[corpusid] = {
-                    "specter_v1": specter_v1,
-                    "specter_v2": specter_v2,
                     "content": content
                 }
             
