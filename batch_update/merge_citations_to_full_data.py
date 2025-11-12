@@ -3,7 +3,6 @@
 支持: 双源合并 + 断点续传 + 跨机器
 """
 
-import json
 import os
 import sys
 import tempfile
@@ -13,10 +12,18 @@ import sqlite3
 import psycopg2
 from psycopg2 import OperationalError, InterfaceError
 import argparse
+import re
 from pathlib import Path
 from typing import Dict, Any, Set, Optional
 from datetime import datetime
 from tqdm import tqdm
+import orjson
+
+# orjson.dumps 返回 bytes，需要解码
+def json_dumps(obj):
+    return orjson.dumps(obj).decode('utf-8')
+
+json_loads = orjson.loads
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -43,6 +50,18 @@ def log(log_file: Path, msg: str):
     with open(log_file, 'a', encoding='utf-8') as f:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         f.write(f"[{timestamp}] {msg}\n")
+
+
+def clean_json_line(line: str) -> str:
+    """清理 JSON 字符串中的非法控制字符"""
+    # 使用字典映射提高效率
+    control_chars = {'\t': '\\t', '\n': '\\n', '\r': '\\r'}
+    
+    def replace_char(match):
+        char = match.group(0)
+        return control_chars.get(char, '')  # 其他控制字符移除
+    
+    return re.sub(r'[\x00-\x1f]', replace_char, line)
 
 
 def init_progress_db(progress_db: Path):
@@ -282,124 +301,158 @@ def process_file_pair(source_file: Path, target_file: Path,
     part2_data = {}
     db_data = {}
     
-    # 阶段1: 创建临时文件
+    # 阶段1: 创建临时文件 (使用字符串路径)
     t1 = time.time()
-    temp_fd, temp_path = tempfile.mkstemp(
+    temp_fd, temp_path_str = tempfile.mkstemp(
         suffix='.jsonl',
-        dir=target_file.parent,
+        dir=str(target_file.parent),
         prefix='.tmp_'
     )
     os.close(temp_fd)
+    temp_path = Path(temp_path_str)
     timings["init_temp"] = time.time() - t1
     
     try:
         BUFFER_SIZE = 1024 * 1024  # 1MB缓冲区
         
-        with open(source_file, 'r', encoding='utf-8', buffering=BUFFER_SIZE) as f_source, \
-             open(target_file, 'r', encoding='utf-8', buffering=BUFFER_SIZE) as f_target, \
-             open(temp_path, 'w', encoding='utf-8', buffering=BUFFER_SIZE) as f_temp:
+        # 使用字符串路径避免 Windows 路径问题
+        with open(str(source_file), 'r', encoding='utf-8', buffering=BUFFER_SIZE) as f_source, \
+             open(str(target_file), 'r', encoding='utf-8', buffering=BUFFER_SIZE) as f_target, \
+             open(str(temp_path), 'w', encoding='utf-8', buffering=BUFFER_SIZE) as f_temp:
             
-            # 阶段2: 预加载part2文件数据到内存
-            t2 = time.time()
-            part2_data = {}
-            for line in f_source:
-                line = line.strip()
-                if not line:
-                    continue
-                stats["source_lines"] += 1
-                record = json.loads(line)
+                # 阶段2: 预加载part2文件数据到内存
+                t2 = time.time()
+                part2_data = {}
+                for line in f_source:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    stats["source_lines"] += 1
+                    
+                    # 清理控制字符
+                    try:
+                        record = json_loads(line)
+                    except (ValueError, Exception) as e:
+                        # 尝试清理后再解析
+                        try:
+                            cleaned_line = clean_json_line(line)
+                            record = json_loads(cleaned_line)
+                            log(log_file, f"警告: 清理了非法字符 (part2文件第{stats['source_lines']}行)")
+                        except (ValueError, Exception):
+                            log(log_file, f"跳过: part2文件第{stats['source_lines']}行解析失败 - {str(e)}")
+                            continue
+                    
+                    if not is_citation_fields_empty(record):
+                        corpusid = record.get("corpusid")
+                        if corpusid is not None:
+                            part2_data[corpusid] = record
+                    else:
+                        stats["skipped_empty"] += 1
+                timings["load_part2"] = time.time() - t2
                 
-                if not is_citation_fields_empty(record):
-                    corpusid = record.get("corpusid")
-                    if corpusid is not None:
-                        part2_data[corpusid] = record
-                else:
-                    stats["skipped_empty"] += 1
-            timings["load_part2"] = time.time() - t2
-            
-            # 阶段3: 从数据库批量加载数据(如果提供了连接)
-            t3 = time.time()
-            db_data = {}
-            if db_conn:
-                corpusid_list = list(part2_data.keys())
-                # 分批查询(每次5000个)
-                BATCH_SIZE = 5000
-                for i in range(0, len(corpusid_list), BATCH_SIZE):
-                    batch = corpusid_list[i:i+BATCH_SIZE]
-                    batch_data = load_db_data(db_conn, batch, db_config, log_file)
-                    db_data.update(batch_data)
-            timings["load_db"] = time.time() - t3
-            
-            # 阶段4: 流式处理目标文件并写入临时文件
-            t4 = time.time()
-            write_buffer = []
-            WRITE_BATCH = 5000
-            write_time = 0
-            
-            for target_line in f_target:
-                target_line = target_line.strip()
-                if not target_line:
-                    continue
+                # 阶段3: 从数据库批量加载数据(如果提供了连接)
+                t3 = time.time()
+                db_data = {}
+                if db_conn:
+                    corpusid_list = list(part2_data.keys())
+                    # 分批查询(每次5000个)
+                    BATCH_SIZE = 5000
+                    for i in range(0, len(corpusid_list), BATCH_SIZE):
+                        batch = corpusid_list[i:i+BATCH_SIZE]
+                        batch_data = load_db_data(db_conn, batch, db_config, log_file)
+                        db_data.update(batch_data)
+                timings["load_db"] = time.time() - t3
                 
-                stats["target_lines"] += 1
-                target_record = json.loads(target_line)
-                target_corpusid = target_record.get("corpusid")
+                # 阶段4: 流式处理目标文件并写入临时文件
+                t4 = time.time()
+                write_buffer = []
+                WRITE_BATCH = 5000
+                write_time = 0
                 
-                record_updated = False
+                for target_line in f_target:
+                    target_line = target_line.strip()
+                    if not target_line:
+                        continue
+                    
+                    stats["target_lines"] += 1
+                    
+                    # 清理控制字符
+                    try:
+                        target_record = json_loads(target_line)
+                    except (ValueError, Exception) as e:
+                        # 尝试清理后再解析
+                        try:
+                            cleaned_line = clean_json_line(target_line)
+                            target_record = json_loads(cleaned_line)
+                            log(log_file, f"警告: 清理了非法字符 (目标文件第{stats['target_lines']}行)")
+                        except (ValueError, Exception):
+                            log(log_file, f"跳过: 目标文件第{stats['target_lines']}行解析失败 - {str(e)}")
+                            # 目标文件解析失败，保留原始行
+                            write_buffer.append(target_line + '\n')
+                            if len(write_buffer) >= WRITE_BATCH:
+                                tw = time.time()
+                                f_temp.writelines(write_buffer)
+                                write_time += time.time() - tw
+                                write_buffer = []
+                            continue
+                    
+                    target_corpusid = target_record.get("corpusid")
+                    
+                    record_updated = False
+                    
+                    # 更新引用字段(从part2文件)
+                    if target_corpusid in part2_data:
+                        cnt = update_record_fields(
+                            target_record, 
+                            part2_data[target_corpusid], 
+                            CITATION_FIELDS,
+                            skip_if_target_not_empty=False
+                        )
+                        if cnt > 0:
+                            stats["updated_citation"] += 1
+                            record_updated = True
+                    
+                    # 更新数据库字段(如果目标字段为空)
+                    if target_corpusid in db_data:
+                        cnt = update_record_fields(
+                            target_record, 
+                            db_data[target_corpusid], 
+                            DB_FIELDS,
+                            skip_if_target_not_empty=True  # 目标不为空则跳过
+                        )
+                        if cnt > 0:
+                            stats["updated_db"] += 1
+                            record_updated = True
+                    
+                    if record_updated:
+                        stats["updated_total"] += 1
+                    
+                    # 批量写入
+                    write_buffer.append(json_dumps(target_record) + '\n')
+                    if len(write_buffer) >= WRITE_BATCH:
+                        tw = time.time()
+                        f_temp.writelines(write_buffer)
+                        write_time += time.time() - tw
+                        write_buffer = []
                 
-                # 更新引用字段(从part2文件)
-                if target_corpusid in part2_data:
-                    cnt = update_record_fields(
-                        target_record, 
-                        part2_data[target_corpusid], 
-                        CITATION_FIELDS,
-                        skip_if_target_not_empty=False
-                    )
-                    if cnt > 0:
-                        stats["updated_citation"] += 1
-                        record_updated = True
-                
-                # 更新数据库字段(如果目标字段为空)
-                if target_corpusid in db_data:
-                    cnt = update_record_fields(
-                        target_record, 
-                        db_data[target_corpusid], 
-                        DB_FIELDS,
-                        skip_if_target_not_empty=True  # 目标不为空则跳过
-                    )
-                    if cnt > 0:
-                        stats["updated_db"] += 1
-                        record_updated = True
-                
-                if record_updated:
-                    stats["updated_total"] += 1
-                
-                # 批量写入
-                write_buffer.append(json.dumps(target_record, ensure_ascii=False) + '\n')
-                if len(write_buffer) >= WRITE_BATCH:
+                # 写入剩余数据
+                if write_buffer:
                     tw = time.time()
                     f_temp.writelines(write_buffer)
                     write_time += time.time() - tw
-                    write_buffer = []
-            
-            # 写入剩余数据
-            if write_buffer:
-                tw = time.time()
-                f_temp.writelines(write_buffer)
-                write_time += time.time() - tw
-            
-            timings["process_target"] = time.time() - t4 - write_time
-            timings["write_temp"] = write_time
+                
+                timings["process_target"] = time.time() - t4 - write_time
+                timings["write_temp"] = write_time
         
-        # 阶段5: 替换文件
+        # 阶段5: 替换文件 (使用字符串路径)
         t5 = time.time()
-        shutil.move(temp_path, target_file)
+        shutil.move(str(temp_path), str(target_file))
         timings["move_file"] = time.time() - t5
         
     except Exception as e:
         try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if os.path.exists(str(temp_path)):
+                os.remove(str(temp_path))
         except:
             pass
         raise e
@@ -580,10 +633,13 @@ def main():
             base_name = source_name[:-6]
             target_file = target_path / f"{base_name}.jsonl"
             
-            if not target_file.exists():
-                log(LOG_FILE, f"跳过: 目标文件不存在 - {target_file.name}")
-                global_stats["skipped"] += 1
-                continue
+            # Machine2 已预先过滤，无需检查；Machine0 需要检查
+            if args.machine != 'machine2':
+                # 使用 os.path.isfile 更可靠
+                if not os.path.isfile(str(target_file)):
+                    log(LOG_FILE, f"跳过: 目标文件不存在 - {target_file.name}")
+                    global_stats["skipped"] += 1
+                    continue
             
             try:
                 stats = process_file_pair(source_file, target_file, db_conn, db_config, LOG_FILE)
