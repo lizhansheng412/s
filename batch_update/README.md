@@ -186,3 +186,13 @@ python batch_update/import_citations.py D:\gz_temp\citations --only-stage4 --for
 8. **预期性能**：优化后每批5万条处理时间应在5-15秒，整体速度提升5-10倍
 
 ---
+python batch_update/merge_citations_to_full_data.py --source-dir "G:\part_two" --target-dir "E:\part_one" --machine machine0 --remote-db
+
+### 本地数据库
+
+python batch_update/merge_citations_to_full_data.py --source-dir "E:\copy_final_cache" --target-dir "F:\final_delivery_1" --machine machine2
+
+### 远程数据库
+
+python batch_update/merge_citations_to_full_data.py --source-dir "E:\copy_final_cache" --target-dir "F:\final_delivery_1" --machine machine0
+

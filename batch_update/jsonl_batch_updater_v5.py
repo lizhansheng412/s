@@ -1,10 +1,10 @@
-"""
+r"""
 JSONL批量更新器 V5 - 内存优化版本
 核心优化：
 1. 将corpusid_mapping_title表分批加载到内存（分3批，每批约4300万条）
-2. 读取E:\copy_final_1下的快速模式JSONL文件
-3. 在内存中查询title，构造完整的对象结构
-4. 写入到E:\copy_final_cache目录
+2. 读取 E:\copy_final_1 下的快速模式 JSONL 文件
+3. 在内存中查询 title，构造完整的对象结构
+4. 写入到 E:\copy_final_cache 目录
 """
 import sys
 from pathlib import Path
@@ -56,7 +56,8 @@ class JSONLBatchUpdaterV5:
         
         print(f"初始化更新器V5:")
         print(f"  目标机器: {machine_id}")
-        print(f"  源目录: {SOURCE_DIR}")
+        print(f"  批次1源目录: {SOURCE_DIR}")
+        print(f"  批次2/3源目录: {OUTPUT_DIR}（在批次1输出的基础上增量更新）")
         print(f"  输出目录: {OUTPUT_DIR}")
         print(f"  分批策略: 将title表分成{BATCH_COUNT}批加载")
         
@@ -192,7 +193,7 @@ class JSONLBatchUpdaterV5:
         """处理单个JSONL文件（快速模式 → 完整模式，或增量更新）
         
         Args:
-            jsonl_path: 源JSONL文件路径
+            jsonl_path: 源JSONL文件路径（批次1来自SOURCE_DIR，批次2-3来自OUTPUT_DIR）
             batch_num: 批次号（1-3）
         
         Returns:
@@ -201,9 +202,13 @@ class JSONLBatchUpdaterV5:
         # 批次1：创建新文件；批次2-3：原地更新
         if batch_num == 1:
             output_path = OUTPUT_DIR / jsonl_path.name
+            # 调试信息
+            # print(f"    [批次1] 读取: {jsonl_path} → 写入: {output_path}")
         else:
             # 批次2-3：使用临时文件，然后替换原文件
             output_path = OUTPUT_DIR / f"{jsonl_path.name}.tmp"
+            # 调试信息：确认批次2-3从OUTPUT_DIR读取
+            # print(f"    [批次{batch_num}] 读取: {jsonl_path} → 临时: {output_path}")
         
         process_start = time.time()
         processed_count = 0
@@ -320,6 +325,15 @@ class JSONLBatchUpdaterV5:
         print("=" * 80)
         
         batch_start = time.time()
+        if batch_num == 1:
+            read_dir = SOURCE_DIR
+            write_desc = f"{OUTPUT_DIR}（创建新文件）"
+        else:
+            read_dir = OUTPUT_DIR
+            write_desc = f"{OUTPUT_DIR}（原地更新，使用临时文件覆盖）"
+        print(f"\n当前批次 {batch_num}:")
+        print(f"  读取目录: {read_dir}")
+        print(f"  写入目录: {write_desc}")
         
         # 加载这一批的title数据到内存
         # 说明：使用OFFSET/LIMIT切割
