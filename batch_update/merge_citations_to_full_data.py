@@ -325,7 +325,7 @@ def process_file_pair(source_file: Path, target_file: Path,
     timings["init_temp"] = time.time() - t1
     
     try:
-        BUFFER_SIZE = 1024 * 1024  # 1MB缓冲区
+        BUFFER_SIZE = 4 * 1024 * 1024  # 4MB缓冲区 (从1MB增加)
         
         # 使用字符串路径避免 Windows 路径问题
         with open(str(source_file), 'r', encoding='utf-8', buffering=BUFFER_SIZE) as f_source, \
@@ -378,7 +378,7 @@ def process_file_pair(source_file: Path, target_file: Path,
                 # 阶段4: 流式处理目标文件并写入临时文件
                 t4 = time.time()
                 write_buffer = []
-                WRITE_BATCH = 5000
+                WRITE_BATCH = 10000  # 从5000增加到10000
                 write_time = 0
                 
                 for target_line in f_target:
@@ -456,9 +456,13 @@ def process_file_pair(source_file: Path, target_file: Path,
                 timings["process_target"] = time.time() - t4 - write_time
                 timings["write_temp"] = write_time
         
-        # 阶段5: 替换文件 (使用字符串路径)
+        # 阶段5: 替换文件 (优化：直接替换避免删除)
         t5 = time.time()
-        shutil.move(str(temp_path), str(target_file))
+        target_file_str = str(target_file)
+        temp_path_str = str(temp_path)
+        
+        # Windows上直接替换（os.replace比删除再重命名更快）
+        os.replace(temp_path_str, target_file_str)
         timings["move_file"] = time.time() - t5
         
     except Exception as e:
