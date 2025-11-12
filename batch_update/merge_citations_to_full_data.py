@@ -341,18 +341,25 @@ def process_file_pair(source_file: Path, target_file: Path,
                         continue
                     stats["source_lines"] += 1
                     
-                    # 清理控制字符
+                    # 清理控制字符和处理编码问题
                     try:
                         record = json_loads(line)
                     except (ValueError, Exception) as e:
-                        # 尝试清理后再解析
+                        # 尝试处理 UTF-8 编码问题
                         try:
-                            cleaned_line = clean_json_line(line)
+                            # 先尝试修复编码（替换无效字符）
+                            cleaned_line = line.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
                             record = json_loads(cleaned_line)
-                            log(log_file, f"警告: 清理了非法字符 (part2文件第{stats['source_lines']}行)")
+                            log(log_file, f"警告: 修复了编码问题 (part2文件第{stats['source_lines']}行)")
                         except (ValueError, Exception):
-                            log(log_file, f"跳过: part2文件第{stats['source_lines']}行解析失败 - {str(e)}")
-                            continue
+                            # 再尝试清理控制字符
+                            try:
+                                cleaned_line = clean_json_line(line)
+                                record = json_loads(cleaned_line)
+                                log(log_file, f"警告: 清理了非法字符 (part2文件第{stats['source_lines']}行)")
+                            except (ValueError, Exception):
+                                log(log_file, f"跳过: part2文件第{stats['source_lines']}行解析失败 - {str(e)}")
+                                continue
                     
                     if not is_citation_fields_empty(record):
                         corpusid = record.get("corpusid")
@@ -388,25 +395,32 @@ def process_file_pair(source_file: Path, target_file: Path,
                     
                     stats["target_lines"] += 1
                     
-                    # 清理控制字符
+                    # 清理控制字符和处理编码问题
                     try:
                         target_record = json_loads(target_line)
                     except (ValueError, Exception) as e:
-                        # 尝试清理后再解析
+                        # 尝试处理 UTF-8 编码问题
                         try:
-                            cleaned_line = clean_json_line(target_line)
+                            # 先尝试修复编码（替换无效字符）
+                            cleaned_line = target_line.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
                             target_record = json_loads(cleaned_line)
-                            log(log_file, f"警告: 清理了非法字符 (目标文件第{stats['target_lines']}行)")
+                            log(log_file, f"警告: 修复了编码问题 (目标文件第{stats['target_lines']}行)")
                         except (ValueError, Exception):
-                            log(log_file, f"跳过: 目标文件第{stats['target_lines']}行解析失败 - {str(e)}")
-                            # 目标文件解析失败，保留原始行
-                            write_buffer.append(target_line + '\n')
-                            if len(write_buffer) >= WRITE_BATCH:
-                                tw = time.time()
-                                f_temp.writelines(write_buffer)
-                                write_time += time.time() - tw
-                                write_buffer = []
-                            continue
+                            # 再尝试清理控制字符
+                            try:
+                                cleaned_line = clean_json_line(target_line)
+                                target_record = json_loads(cleaned_line)
+                                log(log_file, f"警告: 清理了非法字符 (目标文件第{stats['target_lines']}行)")
+                            except (ValueError, Exception):
+                                log(log_file, f"跳过: 目标文件第{stats['target_lines']}行解析失败 - {str(e)}")
+                                # 目标文件解析失败，保留原始行
+                                write_buffer.append(target_line + '\n')
+                                if len(write_buffer) >= WRITE_BATCH:
+                                    tw = time.time()
+                                    f_temp.writelines(write_buffer)
+                                    write_time += time.time() - tw
+                                    write_buffer = []
+                                continue
                     
                     target_corpusid = target_record.get("corpusid")
                     
