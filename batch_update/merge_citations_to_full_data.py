@@ -511,8 +511,8 @@ def main():
     parser.add_argument('--source-dir', required=True, help='源文件目录(xxx_part2.jsonl)')
     parser.add_argument('--target-dir', required=True, help='目标文件目录(xxx.jsonl)')
     parser.add_argument('--machine', required=True, 
-                       choices=['machine0', 'machine2'],
-                       help='机器ID (machine0自动连接远程machine2数据库)')
+                       choices=['machine0', 'machine2', 'machine3'],
+                       help='机器ID (machine0和machine3通过局域网连接machine2数据库, machine2使用本地数据库)')
     
     args = parser.parse_args()
     
@@ -529,23 +529,23 @@ def main():
     init_progress_db(PROGRESS_DB)
     
     # 加载数据库配置
-    if args.machine == 'machine0':
-        # machine0 自动连接远程 machine2 数据库
-        db_config = get_db_config('machine2')
-        print(f"📡 machine0: 自动连接远程 machine2 数据库")
-    else:
+    if args.machine == 'machine2':
         # machine2 使用本地数据库配置
         db_config = get_db_config('machine2')
         print(f"💾 machine2: 使用本地数据库配置")
+    else:
+        # machine0 和 machine3 都通过局域网连接远程 machine2 数据库
+        db_config = get_db_config('machine2')
+        print(f"📡 {args.machine}: 通过局域网连接远程 machine2 数据库")
     
     log(LOG_FILE, "=" * 80)
     log(LOG_FILE, "引用数据合并工具 - 双源合并+断点续传")
     log(LOG_FILE, "=" * 80)
     log(LOG_FILE, f"机器ID: {args.machine}")
-    if args.machine == 'machine0':
-        log(LOG_FILE, f"数据库模式: 远程连接 machine2")
-    else:
+    if args.machine == 'machine2':
         log(LOG_FILE, f"数据库模式: 本地")
+    else:
+        log(LOG_FILE, f"数据库模式: 远程连接 machine2 (局域网)")
     log(LOG_FILE, f"源目录: {SOURCE_DIR}")
     log(LOG_FILE, f"目标目录: {TARGET_DIR}")
     log(LOG_FILE, f"数据库: {db_config['host']}:{db_config['port']}/{db_config['database']}")
@@ -586,6 +586,7 @@ def main():
             return
         
         # 对于 machine2，只处理目标目录中存在对应文件的源文件
+        # machine0 和 machine3 处理所有文件
         if args.machine == 'machine2':
             # 获取目标目录所有文件名（不含后缀）
             target_files_set = set()
@@ -663,7 +664,7 @@ def main():
             base_name = source_name[:-6]
             target_file = target_path / f"{base_name}.jsonl"
             
-            # Machine2 已预先过滤，无需检查；Machine0 需要检查
+            # Machine2 已预先过滤，无需检查；Machine0 和 Machine3 需要检查
             if args.machine != 'machine2':
                 # 使用 os.path.isfile 更可靠
                 if not os.path.isfile(str(target_file)):

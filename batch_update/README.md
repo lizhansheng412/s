@@ -3,6 +3,7 @@
 ## 可用机器
 - `machine0`: s2orc_d0:5430
 - `machine2`: s2orc_d2:5432
+- `machine3`: s2orc_d3:5433
 
 ## 数据集类型
 - `s2orc` / `s2orc_v2` → content字段
@@ -186,13 +187,28 @@ python batch_update/import_citations.py D:\gz_temp\citations --only-stage4 --for
 8. **预期性能**：优化后每批5万条处理时间应在5-15秒，整体速度提升5-10倍
 
 ---
-python batch_update/merge_citations_to_full_data.py --source-dir "G:\part_two" --target-dir "E:\part_one" --machine machine0 --remote-db
 
-### 本地数据库
+## 6. 合并Citations数据到完整数据（merge_citations_to_full_data.py）
 
-python batch_update/merge_citations_to_full_data.py --source-dir "E:\copy_final_cache" --target-dir "F:\final_delivery_1" --machine machine2
+### 数据库连接说明
+- **Machine2**: 使用本地数据库 (localhost:5432)
+- **Machine0 和 Machine3**: 通过局域网连接 Machine2 的数据库 (192.168.0.104:5432)
 
-### 远程数据库
+### Machine0（通过局域网连接machine2数据库）
 
+```bash
 python batch_update/merge_citations_to_full_data.py --source-dir "G:\1500_part2" --target-dir "G:\final_delivery" --machine machine0
+```
+
+### Machine2（使用本地数据库）
+
+```bash
+python batch_update/merge_citations_to_full_data.py --source-dir "E:\copy_final_cache" --target-dir "F:\final_delivery_1" --machine machine2
+```
+
+### Machine3（通过局域网连接machine2数据库）
+
+```bash
+python batch_update/merge_citations_to_full_data.py --source-dir "D:\part2_data" --target-dir "D:\final_data" --machine machine3
+```
 
