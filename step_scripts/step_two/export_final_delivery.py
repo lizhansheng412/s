@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-从 final_delivery 表导出数据到 JSONL（多进程并行版本）
-- 从 final_delivery 表读取 corpusid（按 id 顺序）
+从 full_corpusid 表导出完整数据到 JSONL（多进程并行版本）
+- 从 full_corpusid 表顺序读取 corpusid
 - 仅查询本地数据库（machine0）
 - 输出到 E:\final_delivery
 - 文件名：随机8位UUID.jsonl
+- 支持断点续传（使用 SQLite 记录进度）
 """
 
 import sys
@@ -24,7 +25,7 @@ import psycopg2
 from psycopg2.extras import DictCursor
 
 # 添加项目根目录到路径
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from db_config import get_db_config
 
 # =============================================================================
@@ -33,8 +34,8 @@ from db_config import get_db_config
 
 BATCH_SIZE = 50000  # 每批50000个corpusid
 NUM_WORKERS = 6  # 6个worker进程
-TARGET_TOTAL = 146_430_272  # final_delivery 表的总记录数
 OUTPUT_DIR = r"E:\final_delivery"  # 输出目录
+SQLITE_DB = r"E:\sqlite\export_progress.db"  # SQLite进度数据库
 
 # 队列大小限制
 TASK_QUEUE_SIZE = 8
@@ -88,82 +89,88 @@ def setup_logger(name: str, log_file: str = None, console_output: bool = True, e
 logger = setup_logger('main', LOG_FILE, console_output=True, enable_file=ENABLE_FILE_LOGGING)
 
 # =============================================================================
-# 进度管理
+# SQLite 进度管理
 # =============================================================================
 
-def create_progress_table(conn):
-    """创建导出进度表"""
-    cursor = conn.cursor()
-    try:
+import sqlite3
+
+class ExportProgressRecorder:
+    """导出进度记录器（使用 SQLite）"""
+    
+    def __init__(self, db_path: str):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._init_database()
+    
+    def _init_database(self):
+        cursor = self.conn.cursor()
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS final_delivery_progress (
-                id BIGSERIAL PRIMARY KEY,
-                start_id BIGINT NOT NULL,
+            CREATE TABLE IF NOT EXISTS export_progress (
+                batch_start_corpusid BIGINT PRIMARY KEY,
                 batch_size INT NOT NULL,
-                batch_filename TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
+                filename TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_final_delivery_progress_start_id
-            ON final_delivery_progress(start_id)
-        """)
-        conn.commit()
-    finally:
-        cursor.close()
-
-
-def get_last_progress(conn) -> Optional[Dict]:
-    """获取最后一次成功的进度"""
-    cursor = conn.cursor(cursor_factory=DictCursor)
-    try:
-        cursor.execute("""
-            SELECT start_id, batch_size 
-            FROM final_delivery_progress 
-            ORDER BY id DESC 
-            LIMIT 1
-        """)
+        self.conn.commit()
+    
+    def is_processed(self, start_corpusid: int) -> bool:
+        """检查批次是否已处理"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM export_progress WHERE batch_start_corpusid = ?",
+            (start_corpusid,)
+        )
+        return cursor.fetchone() is not None
+    
+    def add_record(self, start_corpusid: int, batch_size: int, filename: str):
+        """记录已处理的批次"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO export_progress (batch_start_corpusid, batch_size, filename) VALUES (?, ?, ?)",
+            (start_corpusid, batch_size, filename)
+        )
+        self.conn.commit()
+    
+    def get_last_processed(self) -> Optional[int]:
+        """获取最后处理的 corpusid"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT batch_start_corpusid + batch_size FROM export_progress ORDER BY batch_start_corpusid DESC LIMIT 1"
+        )
         result = cursor.fetchone()
-        
-        if result:
-            return dict(result)
-        return None
-    finally:
-        cursor.close()
-
-
-def record_progress(conn, start_id: int, batch_size: int, filename: str):
-    """记录进度"""
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO final_delivery_progress (start_id, batch_size, batch_filename)
-            VALUES (%s, %s, %s)
-        """, (start_id, batch_size, filename))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
+        return result[0] if result else None
+    
+    def close(self):
+        self.conn.close()
 
 # =============================================================================
 # 数据查询函数
 # =============================================================================
 
-def get_corpus_ids_batch(conn, start_id: int, batch_size: int) -> List[int]:
-    """从 final_delivery 表获取一批 corpusid（按 id 顺序）"""
+def get_corpus_ids_batch(conn, offset: int, batch_size: int) -> List[int]:
+    """从 full_corpusid 表获取一批 corpusid（按 corpusid 顺序）"""
     cursor = conn.cursor()
     try:
         cursor.execute("""
             SELECT corpusid 
-            FROM final_delivery 
-            WHERE id >= %s AND id < %s
-            ORDER BY id
-        """, (start_id, start_id + batch_size))
+            FROM full_corpusid 
+            ORDER BY corpusid
+            LIMIT %s OFFSET %s
+        """, (batch_size, offset))
         
         results = cursor.fetchall()
         return [row[0] for row in results]
+    finally:
+        cursor.close()
+
+
+def get_total_corpusid_count(conn) -> int:
+    """获取 full_corpusid 表的总记录数"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) FROM full_corpusid")
+        return cursor.fetchone()[0]
     finally:
         cursor.close()
 
@@ -528,38 +535,40 @@ def worker_process(
                 worker_logger.info(f"Worker-{worker_id} received stop signal")
                 break
             
-            start_id, batch_size = task
+            offset, batch_size = task
             batch_start_time = time.time()
-            worker_logger.info(f"Worker-{worker_id} ========== START Batch {start_id} ==========")
+            worker_logger.info(f"Worker-{worker_id} ========== START Batch offset={offset} ==========")
             
             # 1. 获取 corpus_ids
             step_start = time.time()
-            corpus_ids = get_corpus_ids_batch(local_conn, start_id, batch_size)
+            corpus_ids = get_corpus_ids_batch(local_conn, offset, batch_size)
             step_elapsed = time.time() - step_start
-            worker_logger.info(f"Worker-{worker_id} [Step1-GetCorpusIDs] batch={start_id}, count={len(corpus_ids) if corpus_ids else 0}, time={step_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step1-GetCorpusIDs] offset={offset}, count={len(corpus_ids) if corpus_ids else 0}, time={step_elapsed:.3f}s")
             
             if not corpus_ids:
-                worker_logger.warning(f"Worker-{worker_id} no data for start_id={start_id}")
-                result_queue.put((start_id, None, None))
+                worker_logger.warning(f"Worker-{worker_id} no data for offset={offset}")
+                result_queue.put((corpus_ids[0] if corpus_ids else offset, None, None))
                 continue
+            
+            first_corpusid = corpus_ids[0]
             
             # 2. 批量查询基础表（全部从本地）
             step2_start = time.time()
             
             query_start = time.time()
-            papers_dict = batch_query_table(local_conn, "papers", corpus_ids, worker_logger, start_id)
-            worker_logger.info(f"Worker-{worker_id} [Step2.1-QueryPapers] batch={start_id}, count={len(papers_dict)}, time={time.time()-query_start:.3f}s")
+            papers_dict = batch_query_table(local_conn, "papers", corpus_ids, worker_logger, first_corpusid)
+            worker_logger.info(f"Worker-{worker_id} [Step2.1-QueryPapers] first_id={first_corpusid}, count={len(papers_dict)}, time={time.time()-query_start:.3f}s")
             
             query_start = time.time()
-            abstracts_dict = batch_query_table(local_conn, "abstracts_sorted", corpus_ids, worker_logger, start_id)
-            worker_logger.info(f"Worker-{worker_id} [Step2.2-QueryAbstracts] batch={start_id}, count={len(abstracts_dict)}, time={time.time()-query_start:.3f}s")
+            abstracts_dict = batch_query_table(local_conn, "abstracts", corpus_ids, worker_logger, first_corpusid)
+            worker_logger.info(f"Worker-{worker_id} [Step2.2-QueryAbstracts] first_id={first_corpusid}, count={len(abstracts_dict)}, time={time.time()-query_start:.3f}s")
             
             query_start = time.time()
-            tldrs_dict = batch_query_table(local_conn, "tldrs", corpus_ids, worker_logger, start_id)
-            worker_logger.info(f"Worker-{worker_id} [Step2.3-QueryTldrs] batch={start_id}, count={len(tldrs_dict)}, time={time.time()-query_start:.3f}s")
+            tldrs_dict = batch_query_table(local_conn, "tldrs", corpus_ids, worker_logger, first_corpusid)
+            worker_logger.info(f"Worker-{worker_id} [Step2.3-QueryTldrs] first_id={first_corpusid}, count={len(tldrs_dict)}, time={time.time()-query_start:.3f}s")
             
             step2_elapsed = time.time() - step2_start
-            worker_logger.info(f"Worker-{worker_id} [Step2-QueryBaseTables-TOTAL] batch={start_id}, time={step2_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step2-QueryBaseTables-TOTAL] first_id={first_corpusid}, time={step2_elapsed:.3f}s")
             
             # 3. 合并基础数据
             step_start = time.time()
@@ -567,45 +576,45 @@ def worker_process(
                 corpus_ids, papers_dict, abstracts_dict, tldrs_dict
             )
             step_elapsed = time.time() - step_start
-            worker_logger.info(f"Worker-{worker_id} [Step3-MergeBaseData] batch={start_id}, corrupted={corrupted_count}, time={step_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step3-MergeBaseData] first_id={first_corpusid}, corrupted={corrupted_count}, time={step_elapsed:.3f}s")
             
             # 4. 收集关联ID
             step_start = time.time()
-            author_ids = collect_author_ids(merged_results, worker_logger, start_id)
+            author_ids = collect_author_ids(merged_results, worker_logger, first_corpusid)
             venue_ids = collect_venue_ids(merged_results)
             step_elapsed = time.time() - step_start
-            worker_logger.info(f"Worker-{worker_id} [Step4-CollectRelatedIDs] batch={start_id}, authors={len(author_ids)}, venues={len(venue_ids)}, time={step_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step4-CollectRelatedIDs] first_id={first_corpusid}, authors={len(author_ids)}, venues={len(venue_ids)}, time={step_elapsed:.3f}s")
             
             # 5. 批量查询关联表（全部从本地）
             step5_start = time.time()
             
             query_start = time.time()
-            authors_dict = batch_query_authors(local_conn, list(author_ids), worker_logger, start_id)
-            worker_logger.info(f"Worker-{worker_id} [Step5.1-QueryAuthors] batch={start_id}, result_count={len(authors_dict)}, time={time.time()-query_start:.3f}s")
+            authors_dict = batch_query_authors(local_conn, list(author_ids), worker_logger, first_corpusid)
+            worker_logger.info(f"Worker-{worker_id} [Step5.1-QueryAuthors] first_id={first_corpusid}, result_count={len(authors_dict)}, time={time.time()-query_start:.3f}s")
             
             query_start = time.time()
             venues_dict = batch_query_venues(local_conn, list(venue_ids))
-            worker_logger.info(f"Worker-{worker_id} [Step5.2-QueryVenues] batch={start_id}, count={len(venues_dict)}, time={time.time()-query_start:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step5.2-QueryVenues] first_id={first_corpusid}, count={len(venues_dict)}, time={time.time()-query_start:.3f}s")
             
             step5_elapsed = time.time() - step5_start
-            worker_logger.info(f"Worker-{worker_id} [Step5-QueryRelatedTables-TOTAL] batch={start_id}, time={step5_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step5-QueryRelatedTables-TOTAL] first_id={first_corpusid}, time={step5_elapsed:.3f}s")
             
             # 6. 添加关联数据
             step_start = time.time()
             add_related_data(merged_results, authors_dict, venues_dict)
             step_elapsed = time.time() - step_start
-            worker_logger.info(f"Worker-{worker_id} [Step6-AddRelatedData] batch={start_id}, time={step_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step6-AddRelatedData] first_id={first_corpusid}, time={step_elapsed:.3f}s")
             
             # 7. 发送到结果队列
             step_start = time.time()
-            result_queue.put((start_id, corpus_ids, merged_results))
+            result_queue.put((first_corpusid, corpus_ids, merged_results))
             step_elapsed = time.time() - step_start
-            worker_logger.info(f"Worker-{worker_id} [Step7-PutToResultQueue] batch={start_id}, time={step_elapsed:.3f}s")
+            worker_logger.info(f"Worker-{worker_id} [Step7-PutToResultQueue] first_id={first_corpusid}, time={step_elapsed:.3f}s")
             
             # 批次总计
             batch_elapsed = time.time() - batch_start_time
             worker_logger.info(
-                f"Worker-{worker_id} ========== COMPLETE Batch {start_id}: "
+                f"Worker-{worker_id} ========== COMPLETE Batch first_id={first_corpusid}: "
                 f"{len(corpus_ids)} records in {batch_elapsed:.3f}s (avg {len(corpus_ids)/batch_elapsed:.1f} records/s) =========="
             )
             
@@ -652,12 +661,12 @@ def writer_process(
                 writer_logger.info("Writer received stop signal")
                 break
             
-            start_id, corpus_ids, merged_results = result
-            writer_logger.info(f"Writer ========== START Writing Batch {start_id} ==========")
+            first_corpusid, corpus_ids, merged_results = result
+            writer_logger.info(f"Writer ========== START Writing Batch first_id={first_corpusid} ==========")
             
             if corpus_ids is None or merged_results is None:
-                writer_logger.warning(f"Skipping empty result for start_id={start_id}")
-                progress_queue.put((start_id, False))
+                writer_logger.warning(f"Skipping empty result for first_id={first_corpusid}")
+                progress_queue.put((first_corpusid, False))
                 continue
             
             write_start_time = time.time()
@@ -682,19 +691,19 @@ def writer_process(
                 write_speed_mbs = file_size_mb / file_write_elapsed if file_write_elapsed > 0 else 0
                 
                 writer_logger.info(
-                    f"Writer [Step1-WriteFile] batch={start_id}, file={filename}, "
+                    f"Writer [Step1-WriteFile] first_id={first_corpusid}, file={filename}, "
                     f"records={len(corpus_ids)}, size={file_size_mb:.2f}MB, "
                     f"time={file_write_elapsed:.3f}s, speed={write_speed_mbs:.2f}MB/s"
                 )
                 
                 notify_start = time.time()
-                progress_queue.put((start_id, True, filename))
+                progress_queue.put((first_corpusid, True, filename))
                 notify_elapsed = time.time() - notify_start
-                writer_logger.info(f"Writer [Step2-NotifyComplete] batch={start_id}, time={notify_elapsed:.3f}s")
+                writer_logger.info(f"Writer [Step2-NotifyComplete] first_id={first_corpusid}, time={notify_elapsed:.3f}s")
                 
                 total_elapsed = time.time() - write_start_time
                 writer_logger.info(
-                    f"Writer ========== COMPLETE Batch {start_id}: "
+                    f"Writer ========== COMPLETE Batch first_id={first_corpusid}: "
                     f"{len(corpus_ids)} records in {total_elapsed:.3f}s =========="
                 )
                 
@@ -706,7 +715,7 @@ def writer_process(
                         writer_logger.info(f"Removed failed file: {filename}")
                     except:
                         pass
-                progress_queue.put((start_id, False))
+                progress_queue.put((first_corpusid, False))
                 raise
         
         except Empty:
@@ -749,13 +758,13 @@ def print_progress(processed: int, total: int, speed: float, elapsed: float,
 def main():
     """主函数"""
     print("="*80)
-    print("从 final_delivery 表导出数据 - 并行处理模式")
+    print("从 full_corpusid 表导出完整数据 - 并行处理模式")
     print("="*80)
     print(f"Worker进程数: {NUM_WORKERS}")
     print(f"批次大小: {BATCH_SIZE:,} 条/批")
-    print(f"目标总量: {TARGET_TOTAL:,} 条")
     print(f"输出目录: {OUTPUT_DIR}")
     print(f"数据源: 仅本地数据库 (machine0)")
+    print(f"SQLite进度库: {SQLITE_DB}")
     print("="*80)
     print()
     
@@ -768,19 +777,25 @@ def main():
         print(f"✗ 数据库连接失败: {e}")
         return
     
-    # 创建进度表
-    create_progress_table(local_conn)
+    # 获取总记录数
+    total_count = get_total_corpusid_count(local_conn)
+    print(f"✓ full_corpusid 总记录数: {total_count:,}")
+    
+    # 初始化SQLite进度记录器
+    recorder = ExportProgressRecorder(SQLITE_DB)
     
     # 进度恢复
-    last_progress = get_last_progress(local_conn)
+    last_processed_corpusid = recorder.get_last_processed()
     
-    if last_progress:
-        start_id = last_progress['start_id'] + last_progress['batch_size']
-        already_processed = start_id - 1
-        print(f"✓ 断点续传: 从 start_id={start_id:,} 继续")
-        print(f"  已完成: {already_processed:,} 条 ({already_processed/TARGET_TOTAL*100:.1f}%)")
+    if last_processed_corpusid:
+        # 计算已处理的数量（近似）
+        cursor = local_conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM full_corpusid WHERE corpusid < %s", (last_processed_corpusid,))
+        already_processed = cursor.fetchone()[0]
+        cursor.close()
+        print(f"✓ 断点续传: 从 corpusid={last_processed_corpusid:,} 继续")
+        print(f"  已完成: {already_processed:,} 条 ({already_processed/total_count*100:.1f}%)")
     else:
-        start_id = 1
         already_processed = 0
         print(f"✓ 首次运行: 从头开始处理")
     print()
@@ -822,25 +837,26 @@ def main():
     print()
     
     # 主循环
-    current_id = start_id
+    current_offset = already_processed  # 从已处理的数量开始
     total_processed = already_processed
     overall_start_time = time.time()
-    pending_batches = {}
+    pending_batches = {}  # {first_corpusid: batch_size}
     
     if already_processed > 0:
-        print_progress(total_processed, TARGET_TOTAL, 0, 0, 0, 0)
+        print_progress(total_processed, total_count, 0, 0, 0, 0)
     
     try:
-        while total_processed < TARGET_TOTAL:
+        while total_processed < total_count:
             # 分配任务
             while len(pending_batches) < TASK_QUEUE_SIZE:
-                if current_id >= 1 + TARGET_TOTAL:
+                if current_offset >= total_count:
                     break
                 
                 try:
-                    task_queue.put((current_id, BATCH_SIZE), timeout=1)
-                    pending_batches[current_id] = BATCH_SIZE
-                    current_id += BATCH_SIZE
+                    task_queue.put((current_offset, BATCH_SIZE), timeout=1)
+                    # 暂时使用offset作为key，后续会更新为实际的first_corpusid
+                    pending_batches[current_offset] = BATCH_SIZE
+                    current_offset += BATCH_SIZE
                 except Exception as e:
                     break
             
@@ -849,27 +865,35 @@ def main():
                 progress_result = progress_queue.get(timeout=1)
                 
                 if len(progress_result) == 2:
-                    batch_start_id, success = progress_result
+                    first_corpusid, success = progress_result
                     filename = None
                 else:
-                    batch_start_id, success, filename = progress_result
+                    first_corpusid, success, filename = progress_result
                 
                 if success and filename:
-                    record_progress(local_conn, batch_start_id, BATCH_SIZE, filename)
+                    # 记录到SQLite
+                    recorder.add_record(first_corpusid, BATCH_SIZE, filename)
                     
-                    batch_size = pending_batches.pop(batch_start_id, BATCH_SIZE)
-                    total_processed += batch_size
+                    # 从 pending_batches 中移除（需要找到对应的offset）
+                    # 简化处理：直接按BATCH_SIZE计数
+                    for offset_key in list(pending_batches.keys()):
+                        pending_batches.pop(offset_key)
+                        break
+                    
+                    total_processed += BATCH_SIZE
                     
                     elapsed = time.time() - overall_start_time
                     current_session_processed = total_processed - already_processed
                     speed = current_session_processed / elapsed if elapsed > 0 else 0
-                    print_progress(total_processed, TARGET_TOTAL, speed, elapsed,
+                    print_progress(total_processed, total_count, speed, elapsed,
                                  len(pending_batches), result_queue.qsize())
                     
                 else:
-                    print(f"\n✗ 批次 {batch_start_id} 处理失败!")
-                    pending_batches.pop(batch_start_id, None)
-                    raise Exception(f"Batch {batch_start_id} processing failed")
+                    print(f"\n✗ 批次 first_id={first_corpusid} 处理失败!")
+                    for offset_key in list(pending_batches.keys()):
+                        pending_batches.pop(offset_key)
+                        break
+                    raise Exception(f"Batch first_id={first_corpusid} processing failed")
             
             except Empty:
                 continue
@@ -898,6 +922,7 @@ def main():
         if writer.is_alive():
             writer.terminate()
         
+        recorder.close()
         local_conn.close()
         
         total_elapsed = time.time() - overall_start_time

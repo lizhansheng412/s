@@ -32,11 +32,13 @@ from db_config import get_db_config
 
 # 需要更新的字段
 CITATION_FIELDS = ["citations", "references", "detailsOfCitations", "detailsOfReference"]
-# DB_FIELDS = ["specter_v1", "specter_v2", "content"]
-DB_FIELDS = ["content"]
+DB_FIELDS = ["specter_v1", "specter_v2", "content"]
+# DB_FIELDS = ["content"]
 ALL_UPDATE_FIELDS = CITATION_FIELDS + DB_FIELDS
 
-IGNORE_IS_DONE_FILTER = False
+ENABLE_DB_LOADING = False
+
+IGNORE_IS_DONE_FILTER = True
 IS_DONE_FILTER_VALUE = False  # PostgreSQL boolean 类型
 
 # 重试配置
@@ -369,10 +371,10 @@ def process_file_pair(source_file: Path, target_file: Path,
                         stats["skipped_empty"] += 1
                 timings["load_part2"] = time.time() - t2
                 
-                # 阶段3: 从数据库批量加载数据(如果提供了连接)
+                # 阶段3: 从数据库批量加载数据(如果提供了连接且开关开启)
                 t3 = time.time()
                 db_data = {}
-                if db_conn:
+                if db_conn and ENABLE_DB_LOADING:
                     corpusid_list = list(part2_data.keys())
                     # 分批查询(每次5000个)
                     BATCH_SIZE = 5000
@@ -546,6 +548,7 @@ def main():
         log(LOG_FILE, f"数据库模式: 本地")
     else:
         log(LOG_FILE, f"数据库模式: 远程连接 machine2 (局域网)")
+    log(LOG_FILE, f"数据库加载开关: {'开启 (处理引用+数据库字段)' if ENABLE_DB_LOADING else '关闭 (仅处理引用字段)'}")
     log(LOG_FILE, f"源目录: {SOURCE_DIR}")
     log(LOG_FILE, f"目标目录: {TARGET_DIR}")
     log(LOG_FILE, f"数据库: {db_config['host']}:{db_config['port']}/{db_config['database']}")
@@ -585,9 +588,9 @@ def main():
             print("❌ 错误: 源目录中没有找到 *_part2.jsonl 文件")
             return
         
-        # 对于 machine2，只处理目标目录中存在对应文件的源文件
-        # machine0 和 machine3 处理所有文件
-        if args.machine == 'machine2':
+        # 对于 machine0 和 machine2，只处理目标目录中存在对应文件的源文件
+        # machine3 处理所有文件
+        if args.machine in ['machine0', 'machine2']:
             # 获取目标目录所有文件名（不含后缀）
             target_files_set = set()
             for target_file in target_path.glob("*.jsonl"):
@@ -609,7 +612,7 @@ def main():
             log(LOG_FILE, f"匹配的源文件数: {len(source_files)}")
             
             if not source_files:
-                print("❌ 错误: 没有找到与目标目录匹配的源文件")
+                print(f"❌ 错误: {args.machine} 没有找到与目标目录匹配的源文件")
                 return
         
         # 获取已完成的文件
@@ -664,8 +667,8 @@ def main():
             base_name = source_name[:-6]
             target_file = target_path / f"{base_name}.jsonl"
             
-            # Machine2 已预先过滤，无需检查；Machine0 和 Machine3 需要检查
-            if args.machine != 'machine2':
+            # Machine0 和 Machine2 已预先过滤，无需检查；Machine3 需要检查
+            if args.machine == 'machine3':
                 # 使用 os.path.isfile 更可靠
                 if not os.path.isfile(str(target_file)):
                     log(LOG_FILE, f"跳过: 目标文件不存在 - {target_file.name}")
